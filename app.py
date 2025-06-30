@@ -11,7 +11,7 @@ from csp import apply_csp_middleware  # Import the CSP middleware
 from utils.version import get_version  # Import version management
 from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.traffic_logger import init_traffic_logging  # Import traffic logging
-from utils.logging import get_logger  # Import centralized logging
+from utils.logging import get_logger, log_startup_banner  # Import centralized logging
 # Import WebSocket proxy server - using relative import to avoid @ symbol issues
 from websocket_proxy.app_integration import start_websocket_proxy
 
@@ -208,5 +208,9 @@ if __name__ == '__main__':
     host_ip = os.getenv('FLASK_HOST_IP', '127.0.0.1')  # Default to '127.0.0.1' if not set
     port = int(os.getenv('FLASK_PORT', 5000))  # Default to 5000 if not set
     debug = os.getenv('FLASK_DEBUG', 'False').lower() in ('true', '1', 't')  # Default to False if not set
+
+    # Log the OpenAlgo access URL with enhanced styling
+    url = f"http://{host_ip}:{port}"
+    log_startup_banner(logger, "OpenAlgo is running!", url)
 
     socketio.run(app, host=host_ip, port=port, debug=debug)

@@ -12,6 +12,7 @@ class HistorySchema(Schema):
     interval = fields.Str(required=True)  # 1m, 5m, 15m, 30m, 1h, 1d
     start_date = fields.Str(required=True)  # YYYY-MM-DD
     end_date = fields.Str(required=True)    # YYYY-MM-DD
+    # OI is now always included by default for F&O exchanges
 
 class DepthSchema(Schema):
     apikey = fields.Str(required=True)
@@ -34,3 +35,8 @@ class TickerSchema(Schema):
     to = fields.Str(required=True)          # YYYY-MM-DD or millisecond timestamp
     adjusted = fields.Bool(required=False, default=True)  # Adjust for splits
     sort = fields.Str(required=False, default='asc', validate=lambda x: x in ['asc', 'desc'])  # Sort direction
+
+class SearchSchema(Schema):
+    apikey = fields.Str(required=True)      # API Key for authentication
+    query = fields.Str(required=True)       # Search query/symbol name
+    exchange = fields.Str(required=False)   # Optional exchange filter (e.g., NSE, BSE)
