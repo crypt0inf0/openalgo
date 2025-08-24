@@ -13,7 +13,11 @@ from utils.latency_monitor import init_latency_monitoring  # Import latency moni
 from utils.traffic_logger import init_traffic_logging  # Import traffic logging
 from utils.logging import get_logger, log_startup_banner  # Import centralized logging
 # Import WebSocket proxy server - using relative import to avoid @ symbol issues
-from websocket_proxy.app_integration import start_websocket_proxy
+# Replace the existing WebSocket import
+# from websocket_proxy.app_integration import start_websocket_proxy
+
+# With ultra-low latency version
+from websocket_proxy.ultra_app_integration import start_ultra_websocket_proxy
 
 from blueprints.auth import auth_bp
 from blueprints.dashboard import dashboard_bp
@@ -234,7 +238,11 @@ app = create_app()
 setup_environment(app)
 
 # Integrate the WebSocket proxy server with the Flask app
-start_websocket_proxy(app)
+# In the main section, replace:
+# start_websocket_proxy(app)
+
+# With:
+start_ultra_websocket_proxy(app)
 
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == '__main__':
