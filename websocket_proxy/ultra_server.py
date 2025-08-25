@@ -359,8 +359,8 @@ class UltraWebSocketProxy:
         if user_id not in self.broker_adapters:
             try:
                 # Import the ultra adapter
-                from broker.flattrade.streaming.flattrade_ultra_adapter import FlattradeUltraAdapter
-                adapter = FlattradeUltraAdapter()
+                from broker.flattrade.streaming.flattrade_ultra_adapter import FlattradeUltraAdapterLockFree
+                adapter = FlattradeUltraAdapterLockFree()
                 
                 # Initialize and connect
                 adapter.initialize(broker_name, user_id)
