@@ -13,20 +13,24 @@ services:
     # persistent DB, logs + mount the host .env read-only so dotenv can read it
     volumes:
       - openalgo_db:/app/db
+      - openalgo_logs:/app/logs          # Use named volume for logs
       - ./log:/app/log                   # ← Application logs
-      - ./logs:/app/logs
       - ./strategies:/app/strategies     # ← Python strategies (MAIN FIX)
       - ./keys:/app/keys                 # ← API keys/certificates
       - ./.env:/app/.env:ro
 
     # (optional) extra env-vars that are NOT in .env
     environment:
-      - FLASK_ENV=${FLASK_ENV:-production}
-      - FLASK_DEBUG=${FLASK_DEBUG:-0}
+      - FLASK_ENV=production
+      - FLASK_DEBUG=0
+      - WEBSOCKET_HOST=0.0.0.0
+      - APP_MODE=production
 
     restart: unless-stopped
 
-# Define named volumes for database persistence
+# Define named volumes for database and logs persistence
 volumes:
   openalgo_db:
+    driver: local
+  openalgo_logs:
     driver: local

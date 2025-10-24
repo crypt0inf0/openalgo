@@ -22,11 +22,11 @@ fi
 # Ensure Python can create directories at runtime if needed
 export PYTHONDONTWRITEBYTECODE=1
 
-cd /app
+cd "$(dirname "$0")"
 
 # Start WebSocket proxy server in background
-echo "[OpenAlgo] Starting WebSocket proxy server on port 8765..."
-/app/.venv/bin/python -m websocket_proxy.server &
+echo "[OpenAlgo] Starting WebSocket proxy server..."
+./.venv/bin/python -m websocket_proxy.start_proxy &
 WEBSOCKET_PID=$!
 echo "[OpenAlgo] WebSocket proxy server started with PID $WEBSOCKET_PID"
 
@@ -44,10 +44,11 @@ trap cleanup SIGTERM SIGINT
 
 # Run main application with gunicorn using eventlet for WebSocket support
 echo "[OpenAlgo] Starting application on port 5000 with eventlet..."
-exec /app/.venv/bin/gunicorn \
+exec ./.venv/bin/gunicorn \
     --worker-class eventlet \
     --workers 1 \
     --bind 0.0.0.0:5000 \
+    app:app
     --timeout 120 \
     --graceful-timeout 30 \
     --log-level warning \
