@@ -3,23 +3,25 @@ import asyncio
 import threading
 import json
 import logging
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
-from websocket_proxy.mapping import SymbolMapper
+from websocket_proxy.adapters.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy.adapters.mapping import SymbolMapper
 from .upstox_client import UpstoxWebSocketClient
 from database.auth_db import get_auth_token
 
 
 class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
     """
-    Upstox V3 WebSocket adapter implementation.
+    Upstox V3 WebSocket adapter with lightweight proxy integration.
     
     Features:
     - Handles all WebSocket operations through UpstoxWebSocketClient
     - Processes protobuf messages decoded to dict format
     - Manages subscriptions and market data publishing
+    - Zero-backpressure proxy integration
     """
     
     def __init__(self):
@@ -32,7 +34,10 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.market_status: Dict[str, Any] = {}
         self.connected = False
         self.running = False
-        self.lock = threading.Lock()  # Add threading lock for subscription management
+        self.lock = threading.Lock()
+        
+        # Zero-backpressure proxy reference
+        self.zbp_proxy = None
 
     def initialize(self, broker_name: str, user_id: str, auth_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Initialize the adapter with authentication data"""
@@ -54,6 +59,11 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception as e:
             self.logger.error(f"Initialization error: {e}")
             return self._create_error_response("INIT_ERROR", str(e))
+
+    def set_proxy(self, proxy):
+        """Set the zero-backpressure proxy reference"""
+        self.zbp_proxy = proxy
+        self.logger.info(f"Upstox adapter: zbp_proxy set to {type(proxy)}, has_publish_method={hasattr(proxy, 'publish_market_data')}")
 
     def connect(self) -> Dict[str, Any]:
         """Establish WebSocket connection"""
@@ -210,7 +220,11 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 future.result(timeout=5)
 
             self._stop_event_loop()
-            self.cleanup_zmq()
+            
+            # Clear subscriptions
+            with self.lock:
+                self.subscriptions.clear()
+            
             self.logger.info("Disconnected from Upstox WebSocket")
 
         except Exception as e:
@@ -398,7 +412,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         if "marketInfo" in data:
             self.market_status = data["marketInfo"]
             if "segmentStatus" in self.market_status:
-                self.logger.debug(f"Market status update: {self.market_status['segmentStatus']}")
+                self.logger.info(f"Market status update: {self.market_status['segmentStatus']}")
 
     def _process_feed(self, feed_key: str, feed_data: Dict[str, Any], current_ts: int):
         """Process individual feed data"""
@@ -421,7 +435,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             matching_subscriptions.append((correlation_id, sub_info))
                             self.logger.debug(f"Matched by token: {correlation_id}")
                 
-                self.logger.debug(f"Found {len(matching_subscriptions)} matching subscriptions for {feed_key}")
+                self.logger.info(f"Found {len(matching_subscriptions)} matching subscriptions for {feed_key}")
             
             if not matching_subscriptions:
                 self.logger.warning(f"No subscription found for feed key: {feed_key}")
@@ -438,23 +452,38 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 market_data = self._extract_market_data(feed_data, sub_info, current_ts)
                 
                 if market_data:
-                    self.logger.debug(f"Publishing data for {symbol} mode {mode} on topic: {topic}")
-                    if mode == 2:  # Quote mode - show the complete data structure
-                        self.logger.debug(f"QUOTE DATA: {market_data}")
+                    # Normalize data and add metadata
+                    normalized_data = self._normalize_market_data(market_data, mode)
+                    normalized_data.update({
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'broker': 'upstox',
+                        'timestamp': int(time.time() * 1000)
+                    })
                     
-                    if mode == 3:  # Depth mode
-                        # For depth mode, structure the data properly with LTP at top level
-                        depth_data = market_data.copy()
-                        depth_levels = {
-                            'buy': depth_data.pop('buy', []),
-                            'sell': depth_data.pop('sell', []),
-                            'timestamp': depth_data.get('timestamp', current_ts)
-                        }
-                        # Keep LTP and other data at top level, put depth levels in 'depth' key
-                        depth_data['depth'] = depth_levels
-                        self.publish_market_data(topic, depth_data)
+                    # Add broker timestamp for latency measurement
+                    broker_timestamp_ms = time.time() * 1000
+                    normalized_data['broker_timestamp'] = broker_timestamp_ms
+                    
+                    # Publish to zero-backpressure proxy
+                    self.logger.debug(f"[UPSTOX] About to publish {symbol}, zbp_proxy={self.zbp_proxy is not None}")
+                    
+                    if self.zbp_proxy:
+                        if hasattr(self.zbp_proxy, 'publish_market_data'):
+                            self.logger.debug(f"[UPSTOX] Calling publish_market_data for {symbol}")
+                            try:
+                                success = self.zbp_proxy.publish_market_data(symbol, normalized_data)
+                                if success:
+                                    mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[mode]
+                                    self.logger.debug(f"Published {symbol} data: LTP={normalized_data.get('ltp', 'N/A')}, Mode={mode_str}, Broker_TS={broker_timestamp_ms}")
+                                else:
+                                    self.logger.warning(f"Failed to publish market data for {symbol}")
+                            except Exception as e:
+                                self.logger.error(f"Exception calling publish_market_data for {symbol}: {e}", exc_info=True)
+                        else:
+                            self.logger.error(f"zbp_proxy does not have publish_market_data method! Type: {type(self.zbp_proxy)}")
                     else:
-                        self.publish_market_data(topic, market_data)
+                        self.logger.warning("Zero-backpressure proxy not available")
                     
         except Exception as e:
             self.logger.error(f"Error processing feed for {feed_key}: {e}")
@@ -503,7 +532,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         ff = full_feed.get("marketFF") or full_feed.get("indexFF", {})
         
         # Log the full feed structure to understand available fields
-        self.logger.debug(f"Full feed structure for quote extraction: {list(ff.keys())}")
+        self.logger.info(f"Full feed structure for quote extraction: {list(ff.keys())}")
         
         # Extract LTP and quantity data
         ltpc = ff.get("ltpc", {})
@@ -516,16 +545,16 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         
         # Extract market level data - try different possible field names
         market_level = ff.get("marketLevel", {})
-        self.logger.debug(f"Market level keys: {list(market_level.keys()) if market_level else 'None'}")
+        self.logger.info(f"Market level keys: {list(market_level.keys()) if market_level else 'None'}")
         
         # Also check what's in OHLC
-        self.logger.debug(f"OHLC keys: {list(ohlc.keys()) if ohlc else 'None'}")
+        self.logger.info(f"OHLC keys: {list(ohlc.keys()) if ohlc else 'None'}")
         
         # Check if there are other sections with volume data
         if "marketStatus" in ff:
             self.logger.info(f"Market status keys: {list(ff['marketStatus'].keys())}")
         if "optionGreeks" in ff:
-            self.logger.debug(f"Option Greeks keys: {list(ff['optionGreeks'].keys())}")
+            self.logger.info(f"Option Greeks keys: {list(ff['optionGreeks'].keys())}")
         
         # Extract volume from OHLC (confirmed working)
         volume = ohlc.get("vol", 0) if ohlc else 0
@@ -546,7 +575,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
             "low": float(ohlc.get("low", 0)),
             "close": float(ohlc.get("close", 0)),
             "ltp": float(ltp),
-            "last_trade_quantity": int(ltq),
+            "last_quantity": int(ltq),
             "volume": int(volume),
             "average_price": float(avg_price),
             "total_buy_quantity": int(total_buy_qty),
@@ -599,3 +628,93 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
             'timestamp': current_ts,
             'ltp': ltp  # Include LTP in the depth data
         }
+    def _normalize_market_data(self, data: Dict[str, Any], mode: int) -> Dict[str, Any]:
+        """Normalize Upstox data format to standard format"""
+        if mode == 1:  # LTP mode
+            return {
+                'mode': 1,
+                'ltp': self._safe_float(data.get('ltp')),
+                'ltt': data.get('ltt', int(time.time() * 1000))
+            }
+        
+        elif mode == 2:  # Quote mode
+            return {
+                'mode': 2,
+                'ltp': self._safe_float(data.get('ltp')),
+                'volume': self._safe_int(data.get('volume')),
+                'open': self._safe_float(data.get('open')),
+                'high': self._safe_float(data.get('high')),
+                'low': self._safe_float(data.get('low')),
+                'close': self._safe_float(data.get('close')),
+                'last_quantity': self._safe_int(data.get('last_quantity')),
+                'average_price': self._safe_float(data.get('average_price')),
+                'total_buy_quantity': self._safe_int(data.get('total_buy_quantity')),
+                'total_sell_quantity': self._safe_int(data.get('total_sell_quantity')),
+                'ltt': data.get('timestamp', int(time.time() * 1000))
+            }
+        
+        elif mode == 3:  # Depth mode
+            result = {
+                'mode': 3,
+                'ltp': self._safe_float(data.get('ltp')),
+                'timestamp': data.get('timestamp', int(time.time() * 1000))
+            }
+            
+            # Add depth data if available
+            if 'buy' in data and 'sell' in data:
+                result['depth'] = {
+                    'buy': data.get('buy', []),
+                    'sell': data.get('sell', [])
+                }
+                result['depth_level'] = 5
+            
+            return result
+        
+        return {}
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        """Safely convert value to float"""
+        if value is None or value == '' or value == '-':
+            return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+
+    def _safe_int(self, value: Any, default: int = 0) -> int:
+        """Safely convert value to int"""
+        if value is None or value == '' or value == '-':
+            return default
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            return default
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get adapter statistics"""
+        return {
+            'broker': 'upstox',
+            'connected': self.connected,
+            'running': self.running,
+            'subscriptions': len(self.subscriptions),
+            'event_loop_running': self.event_loop is not None and not self.event_loop.is_closed() if self.event_loop else False,
+            'ws_thread_alive': self.ws_thread.is_alive() if self.ws_thread else False
+        }
+
+    def cleanup(self) -> None:
+        """Clean up adapter resources"""
+        try:
+            self.disconnect()
+            self.logger.info("Upstox adapter cleanup completed")
+        except Exception as e:
+            self.logger.error(f"Error during Upstox adapter cleanup: {e}")
+
+    def _create_success_response(self, message: str, **kwargs) -> Dict[str, Any]:
+        """Create standardized success response"""
+        response = {"status": "success", "message": message}
+        response.update(kwargs)
+        return response
+
+    def _create_error_response(self, code: str, message: str) -> Dict[str, Any]:
+        """Create standardized error response"""
+        return {"status": "error", "code": code, "message": message}

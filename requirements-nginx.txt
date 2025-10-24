@@ -143,3 +143,4 @@ zipp==3.19.2
 zmq==0.0.0
 gunicorn
 eventlet
+xxhash==3.5.0

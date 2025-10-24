@@ -13,7 +13,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Set, Any, Callable
 
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy.adapters.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy.adapters.mapping import SymbolMapper
 from database.token_db import get_token
 from database.auth_db import get_auth_token
 
@@ -22,8 +23,8 @@ from .zerodha_websocket import ZerodhaWebSocket
 
 class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
     """
-    Fixed Zerodha-specific implementation of the WebSocket adapter.
-    Properly implements OpenAlgo WebSocket proxy interface with correct topic formatting.
+    Zerodha WebSocket adapter with lightweight proxy integration.
+    Properly implements OpenAlgo WebSocket proxy interface with zero-backpressure publishing.
     """
     
     def __init__(self):
@@ -59,6 +60,9 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.subscription_queue = []
         self.batch_timer = None
         self.batch_delay = 0.5  # 500ms delay to collect more subscriptions in a batch
+        
+        # Zero-backpressure proxy reference
+        self.zbp_proxy = None
     
     def initialize(self, broker_name: str, user_id: str, auth_data: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Initialize the adapter with broker credentials"""
@@ -109,6 +113,11 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception as e:
             self.logger.error(f"Error initializing adapter: {e}")
             return {'status': 'error', 'message': str(e)}
+
+    def set_proxy(self, proxy):
+        """Set the zero-backpressure proxy reference"""
+        self.zbp_proxy = proxy
+        self.logger.info(f"Zerodha adapter: zbp_proxy set to {type(proxy)}, has_publish_method={hasattr(proxy, 'publish_market_data')}")
     
     def connect(self) -> Dict[str, Any]:
         """Connect to Zerodha WebSocket"""
@@ -427,53 +436,40 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     data_exchange = self._map_data_exchange(subscription_exchange)
                     transformed_tick['exchange'] = data_exchange
                     
-                    # If we have a 'full' mode tick, create and publish separate messages for each subscribed mode
-                    if original_tick_mode == 'full':
-                        # Always publish the full depth data first
-                        depth_tick = transformed_tick.copy()
-                        depth_tick['mode'] = 'full'
-                        depth_topic = self._generate_topic(symbol, subscription_exchange, 'DEPTH')
-                        self.logger.debug(f"📊 Publishing DEPTH data to topic: {depth_topic}")
-                        self.publish_market_data(depth_topic, depth_tick)
+                    # Process each subscribed mode and publish normalized data
+                    for mode_num in subscribed_modes:
+                        # Normalize data based on mode
+                        normalized_data = self._normalize_market_data(transformed_tick, mode_num)
+                        normalized_data.update({
+                            'symbol': symbol,
+                            'exchange': data_exchange,
+                            'broker': self.broker_name,
+                            'timestamp': int(time.time() * 1000)
+                        })
                         
-                        # If subscribed to Quote (mode 2), publish quote data
-                        if 2 in subscribed_modes:
-                            quote_tick = transformed_tick.copy()
-                            # Remove depth data for quote message
-                            if 'depth' in quote_tick:
-                                del quote_tick['depth']
-                            quote_tick['mode'] = 'quote'
-                            quote_topic = self._generate_topic(symbol, subscription_exchange, 'QUOTE')
-                            self.logger.debug(f"📊 Publishing QUOTE data to topic: {quote_topic}")
-                            self.publish_market_data(quote_topic, quote_tick)
+                        # Add broker timestamp for latency measurement
+                        broker_timestamp_ms = time.time() * 1000
+                        normalized_data['broker_timestamp'] = broker_timestamp_ms
                         
-                        # If subscribed to LTP (mode 1), publish LTP data
-                        if 1 in subscribed_modes:
-                            ltp_tick = {
-                                'symbol': symbol,
-                                'exchange': data_exchange,
-                                'mode': 'ltp',
-                                'ltp': transformed_tick.get('ltp', 0),
-                                'timestamp': transformed_tick.get('timestamp', int(time.time() * 1000))
-                            }
-                            ltp_topic = self._generate_topic(symbol, subscription_exchange, 'LTP')
-                            self.logger.debug(f"📊 Publishing LTP data to topic: {ltp_topic}")
-                            self.publish_market_data(ltp_topic, ltp_tick)
-                            self.logger.debug(f"📊 LTP Data should be available for polling: {subscription_exchange}:{symbol}")
-                    else:
-                        # For non-full modes, just publish as-is
-                        mode_str = {
-                            'ltp': 'LTP',
-                            'quote': 'QUOTE',
-                            'full': 'DEPTH'
-                        }.get(original_tick_mode, 'LTP')
+                        # Publish to zero-backpressure proxy
+                        self.logger.debug(f"[ZERODHA] About to publish {symbol}, zbp_proxy={self.zbp_proxy is not None}")
                         
-                        topic = self._generate_topic(symbol, subscription_exchange, mode_str)
-                        self.logger.debug(f"📊 Publishing to topic: {topic}")
-                        self.logger.debug(f"📊 Data structure: {transformed_tick}")
-                        
-                        # Publish to ZeroMQ
-                        self.publish_market_data(topic, transformed_tick)
+                        if self.zbp_proxy:
+                            if hasattr(self.zbp_proxy, 'publish_market_data'):
+                                self.logger.debug(f"[ZERODHA] Calling publish_market_data for {symbol}")
+                                try:
+                                    success = self.zbp_proxy.publish_market_data(symbol, normalized_data)
+                                    if success:
+                                        mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[mode_num]
+                                        self.logger.debug(f"Published {symbol} data: LTP={normalized_data.get('ltp', 'N/A')}, Mode={mode_str}, Broker_TS={broker_timestamp_ms}")
+                                    else:
+                                        self.logger.warning(f"Failed to publish market data for {symbol}")
+                                except Exception as e:
+                                    self.logger.error(f"Exception calling publish_market_data for {symbol}: {e}", exc_info=True)
+                            else:
+                                self.logger.error(f"zbp_proxy does not have publish_market_data method! Type: {type(self.zbp_proxy)}")
+                        else:
+                            self.logger.warning("Zero-backpressure proxy not available")
                         
         except Exception as e:
             self.logger.error(f"Error handling ticks: {e}")
@@ -895,18 +891,14 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.token_to_symbol.clear()
                     self.logger.info("WebSocket client stopped and references cleared")
                 
-            # Clean up ZeroMQ resources
-            self.cleanup_zmq()
+            # Clear subscriptions
+            with self.lock:
+                self.subscribed_symbols.clear()
+                self.token_to_symbol.clear()
             
             return {'status': 'success', 'message': 'Disconnected successfully and resources cleaned up'}
         except Exception as e:
             self.logger.error(f"Error disconnecting: {e}")
-            try:
-                # Last attempt to clean up ZMQ resources
-                self.cleanup_zmq()
-            except Exception as zmq_err:
-                self.logger.error(f"Error during ZMQ cleanup after disconnect error: {zmq_err}")
-            
             return {'status': 'error', 'message': f"Error disconnecting: {e}"}
         
     def cleanup(self):
@@ -930,17 +922,9 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.subscribed_symbols.clear()
                 self.token_to_symbol.clear()
             
-            # Clean up ZMQ resources using base class method
-            self.cleanup_zmq()
-            
             self.logger.info("✅ Zerodha adapter cleaned up completely")
         except Exception as e:
             self.logger.error(f"Error during cleanup: {e}")
-            # Try one last time to clean up ZMQ resources
-            try:
-                self.cleanup_zmq()
-            except Exception as zmq_err:
-                self.logger.error(f"Error cleaning up ZMQ during final cleanup attempt: {zmq_err}")
     
     def __del__(self):
         """Destructor - ensures resources are released even when adapter is garbage collected"""
@@ -959,3 +943,94 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception:
             # Can't use logger in __del__ reliably
             pass
+    def _normalize_market_data(self, data: Dict[str, Any], mode: int) -> Dict[str, Any]:
+        """Normalize Zerodha data format to standard format"""
+        if mode == 1:  # LTP mode
+            return {
+                'mode': 1,
+                'ltp': self._safe_float(data.get('ltp')),
+                'ltt': data.get('ltt', int(time.time() * 1000))
+            }
+        
+        elif mode == 2:  # Quote mode
+            return {
+                'mode': 2,
+                'ltp': self._safe_float(data.get('ltp')),
+                'volume': self._safe_int(data.get('volume')),
+                'open': self._safe_float(data.get('open')),
+                'high': self._safe_float(data.get('high')),
+                'low': self._safe_float(data.get('low')),
+                'close': self._safe_float(data.get('close')),
+                'last_quantity': self._safe_int(data.get('last_quantity')),
+                'average_price': self._safe_float(data.get('average_price')),
+                'total_buy_quantity': self._safe_int(data.get('total_buy_quantity')),
+                'total_sell_quantity': self._safe_int(data.get('total_sell_quantity')),
+                'ltt': data.get('ltt', int(time.time() * 1000))
+            }
+        
+        elif mode == 3:  # Depth mode
+            result = {
+                'mode': 3,
+                'ltp': self._safe_float(data.get('ltp')),
+                'volume': self._safe_int(data.get('volume')),
+                'open': self._safe_float(data.get('open')),
+                'high': self._safe_float(data.get('high')),
+                'low': self._safe_float(data.get('low')),
+                'close': self._safe_float(data.get('close')),
+                'timestamp': data.get('timestamp', int(time.time() * 1000)),
+                'ltt': data.get('ltt', int(time.time() * 1000))
+            }
+            
+            # Add depth data if available
+            if 'depth' in data:
+                result['depth'] = data['depth']
+                result['depth_level'] = 5
+            
+            # Add Open Interest for derivatives
+            if 'oi' in data:
+                result['oi'] = self._safe_int(data.get('oi'))
+                result['open_interest'] = self._safe_int(data.get('oi'))
+            
+            return result
+        
+        return {}
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        """Safely convert value to float"""
+        if value is None or value == '' or value == '-':
+            return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+
+    def _safe_int(self, value: Any, default: int = 0) -> int:
+        """Safely convert value to int"""
+        if value is None or value == '' or value == '-':
+            return default
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            return default
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get adapter statistics"""
+        return {
+            'broker': self.broker_name,
+            'connected': self.connected,
+            'running': self.running,
+            'subscriptions': len(self.subscribed_symbols),
+            'reconnect_attempts': self.reconnect_attempts,
+            'ws_client_running': self.ws_client.running if self.ws_client else False,
+            'ws_client_connected': self.ws_client.is_connected() if self.ws_client else False
+        }
+
+    def _create_success_response(self, message: str, **kwargs) -> Dict[str, Any]:
+        """Create standardized success response"""
+        response = {"status": "success", "message": message}
+        response.update(kwargs)
+        return response
+
+    def _create_error_response(self, code: str, message: str) -> Dict[str, Any]:
+        """Create standardized error response"""
+        return {"status": "error", "code": code, "message": message}

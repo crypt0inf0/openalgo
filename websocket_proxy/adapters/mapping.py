@@ -1,5 +1,5 @@
 from utils.logging import get_logger
-from database.token_db import get_token, get_brexchange
+from database.token_db import get_token, get_brexchange, get_br_symbol
 from database.symbol import SymToken
 
 class ExchangeMapper:
@@ -39,12 +39,13 @@ class SymbolMapper:
             exchange (str): Exchange code (e.g., 'NSE', 'BSE')
             
         Returns:
-            dict: Token data with 'token' and 'brexchange' or None if not found
+            dict: Token data with 'token', 'brexchange', and 'brsymbol' or None if not found
         """
         try:
-            # Get token from database
+            # Get token and related data from database
             token = get_token(symbol, exchange)
             brexchange = get_brexchange(symbol, exchange)
+            brsymbol = get_br_symbol(symbol, exchange)
             
             if not token or not brexchange:
                 SymbolMapper.logger.error(f"Symbol not found: {symbol}-{exchange}")
@@ -52,7 +53,8 @@ class SymbolMapper:
                 
             return {
                 'token': token,
-                'brexchange': brexchange
+                'brexchange': brexchange,
+                'brsymbol': brsymbol  # Add brsymbol for Fyers (and other brokers)
             }
         except Exception as e:
             SymbolMapper.logger.exception(f"Error retrieving symbol: {e}")
@@ -111,7 +113,7 @@ class BrokerCapabilityRegistry:
             requested_depth (int): Requested depth level
             
         Returns:
-            int: Highest supported depth level that is ≤ requested depth
+            int: Highest supported depth level that is â‰¤ requested depth
         """
         supported_depths = cls.get_supported_depth_levels(broker, exchange)
         # Find the highest supported depth that's less than or equal to requested depth

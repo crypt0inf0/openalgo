@@ -14,8 +14,8 @@ from utils.traffic_logger import init_traffic_logging  # Import traffic logging
 from utils.security_middleware import init_security_middleware  # Import security middleware
 from utils.logging import get_logger, log_startup_banner, highlight_url  # Import centralized logging
 from utils.socketio_error_handler import init_socketio_error_handling  # Import Socket.IO error handler
-# Import WebSocket proxy server - using relative import to avoid @ symbol issues
-from websocket_proxy.app_integration import start_websocket_proxy
+# Import WebSocket proxy server - LMAX Disruptor for zero queue buildup
+from websocket_proxy import start_disruptor_proxy
 
 from blueprints.auth import auth_bp
 from blueprints.dashboard import dashboard_bp
@@ -298,6 +298,14 @@ def setup_environment(app):
     with app.app_context():
         #load broker plugins
         app.broker_auth_functions = load_broker_auth_functions()
+        
+        # Import broker adapters to register them with the websocket proxy system
+        try:
+            import broker  # This will trigger registration of all broker adapters
+            logger.info("Broker adapters imported and registered successfully")
+        except ImportError as e:
+            logger.warning(f"Could not import broker adapters: {e}")
+        
         # Ensure all the tables exist
         ensure_auth_tables_exists()
         ensure_user_tables_exists()
@@ -354,7 +362,7 @@ with app.app_context():
     except Exception as e:
         logger.error(f"Error checking analyzer mode on startup: {e}")
 
-# Integrate the WebSocket proxy server with the Flask app
+# Integrate the Disruptor WebSocket proxy server with the Flask app
 # Check if running in Docker (standalone mode) or local (integrated mode)
 # Docker is detected by checking for /.dockerenv file or APP_MODE override
 is_docker = os.path.exists('/.dockerenv') or os.environ.get('APP_MODE', '').strip().strip("'\"") == 'standalone'
@@ -362,8 +370,8 @@ is_docker = os.path.exists('/.dockerenv') or os.environ.get('APP_MODE', '').stri
 if is_docker:
     logger.info("Running in Docker/standalone mode - WebSocket server started separately by start.sh")
 else:
-    logger.info("Running in local/integrated mode - Starting WebSocket proxy in Flask")
-    start_websocket_proxy(app)
+    logger.info("Running in local/integrated mode - Starting Disruptor WebSocket proxy")
+    start_disruptor_proxy(app)
 
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == '__main__':

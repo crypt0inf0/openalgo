@@ -8,28 +8,12 @@ import logging
 import time
 from typing import Dict, Any, Optional, List
 from enum import IntEnum
+import os
 
 from database.auth_db import get_auth_token
 from database.token_db import get_token
-
-import sys
-import os
-
-# Add parent directory to path to allow imports FIRST
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../../'))
-
-# CRITICAL: Import config to load .env file which sets ZMQ_PORT
-# This must happen before any WebSocket server initialization
-import utils.config  # This loads .env file at module level
-
-# Ensure ZMQ_PORT is set (fallback if not in .env)
-if not os.getenv('ZMQ_PORT'):
-    os.environ['ZMQ_PORT'] = '5555'
-    temp_logger = logging.getLogger("flattrade_init")
-    temp_logger.info("ZMQ_PORT not found in environment, setting to 5555")
-
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
-from websocket_proxy.mapping import SymbolMapper
+from websocket_proxy.adapters.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy.adapters.mapping import SymbolMapper
 from .flattrade_mapping import FlattradeExchangeMapper, FlattradeCapabilityRegistry
 from .flattrade_websocket import FlattradeWebSocket
 
@@ -240,20 +224,10 @@ class DepthNormalizer:
 
 class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
     """Flattrade WebSocket adapter with improved structure and error handling"""
-
+    
     def __init__(self):
         super().__init__()
         self.logger = logging.getLogger("flattrade_websocket")
-
-        # Log the actual ZMQ port being used
-        actual_zmq_port = os.getenv('ZMQ_PORT', '5555')
-        self.logger.info(f"Flattrade adapter initialized - Expected ZMQ port: {actual_zmq_port}, Actual bound port: {self.zmq_port}")
-
-        # Warn if there's a mismatch
-        if str(self.zmq_port) != str(actual_zmq_port):
-            self.logger.warning(f"ZMQ port mismatch! Server expects {actual_zmq_port} but adapter bound to {self.zmq_port}")
-            self.logger.warning("Data may not reach clients properly!")
-
         self._setup_adapter()
         self._setup_market_cache()
         self._setup_connection_management()
@@ -286,25 +260,34 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             Config.MODE_QUOTE: QuoteNormalizer(),
             Config.MODE_DEPTH: DepthNormalizer()
         }
+        
+        # Zero-backpressure proxy reference
+        self.zbp_proxy = None
 
-    def initialize(self, broker_name: str, user_id: str, auth_data: Optional[Dict[str, str]] = None) -> None:
+    def initialize(self, broker_name: str, user_id: str, auth_data: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Initialize connection with Flattrade WebSocket API"""
         self.user_id = user_id
         self.broker_name = broker_name
         
         # Get Flattrade credentials
-        api_key = os.getenv('BROKER_API_KEY', '')
-        if ':::' in api_key:
-            self.actid = api_key.split(':::')[0]
+        if auth_data:
+            self.actid = auth_data.get('actid', user_id)
+            self.susertoken = auth_data.get('susertoken')
         else:
-            self.actid = user_id
-        
-        # Get auth token from database
-        self.susertoken = get_auth_token(user_id)
+            # Get from environment or database
+            api_key = os.getenv('BROKER_API_KEY', '')
+            if ':::' in api_key:
+                self.actid = api_key.split(':::')[0]
+            else:
+                self.actid = user_id
+            
+            # Get auth token from database
+            self.susertoken = get_auth_token(user_id)
         
         if not self.actid or not self.susertoken:
-            self.logger.error(f"Missing Flattrade credentials for user {user_id}")
-            raise ValueError(f"Missing Flattrade credentials for user {user_id}")
+            error_msg = f"Missing Flattrade credentials for user {user_id}"
+            self.logger.error(error_msg)
+            return self._create_error_response("MISSING_CREDENTIALS", error_msg)
         
         self.logger.info(f"Using Flattrade credentials - User ID: {self.actid}")
         
@@ -320,22 +303,39 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         )
         
         self.running = True
+        
+        return self._create_success_response(f"Flattrade adapter initialized for user {user_id}")
 
-    def connect(self) -> None:
+    def set_proxy(self, proxy):
+        """Set the zero-backpressure proxy reference"""
+        self.zbp_proxy = proxy
+        self.logger.info(f"Flattrade adapter: zbp_proxy set to {type(proxy)}, has_publish_method={hasattr(proxy, 'publish_market_data')}")
+
+    def connect(self) -> Dict[str, Any]:
         """Establish connection to Flattrade WebSocket endpoint"""
         if not self.ws_client:
-            self.logger.error("WebSocket client not initialized. Call initialize() first.")
-            return
+            error_msg = "WebSocket client not initialized. Call initialize() first."
+            self.logger.error(error_msg)
+            return self._create_error_response("NOT_INITIALIZED", error_msg)
         
         self.logger.info("Connecting to Flattrade WebSocket...")
-        connected = self.ws_client.connect()
         
-        if connected:
-            self.connected = True
-            self.reconnect_attempts = 0
-            self.logger.info("Connected to Flattrade WebSocket successfully")
-        else:
-            raise ConnectionError("Failed to connect to Flattrade WebSocket")
+        try:
+            connected = self.ws_client.connect()
+            
+            if connected:
+                self.connected = True
+                self.reconnect_attempts = 0
+                self.logger.info("Connected to Flattrade WebSocket successfully")
+                return self._create_success_response("Connected to Flattrade WebSocket")
+            else:
+                error_msg = "Failed to connect to Flattrade WebSocket"
+                self.logger.error(error_msg)
+                return self._create_error_response("CONNECTION_FAILED", error_msg)
+        except Exception as e:
+            error_msg = f"Connection error: {str(e)}"
+            self.logger.error(error_msg)
+            return self._create_error_response("CONNECTION_ERROR", error_msg)
 
     def disconnect(self) -> None:
         """Disconnect from Flattrade WebSocket endpoint"""
@@ -347,111 +347,52 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Clean up market data cache
         self.market_cache.clear()
         
-        # Clean up ZeroMQ resources
-        self.cleanup_zmq()
-        
         self.connected = False
         self.logger.info("Disconnected from Flattrade WebSocket")
 
     def subscribe(self, symbol: str, exchange: str, mode: int = Config.MODE_QUOTE, depth_level: int = 5) -> Dict[str, Any]:
         """Subscribe to market data with improved error handling"""
         try:
-            self.logger.info(f"[SUBSCRIBE] Request for {symbol}.{exchange} mode={mode}")
-
             # Validate inputs
             if not self._validate_subscription_params(symbol, exchange, mode):
                 return self._create_error_response("INVALID_PARAMS", "Invalid subscription parameters")
-
+            
             # Get token information
             token_info = self._get_token_info(symbol, exchange)
             if not token_info:
                 return self._create_error_response("SYMBOL_NOT_FOUND", f"Symbol {symbol} not found")
-
+            
             # Create subscription
             subscription = self._create_subscription(symbol, exchange, mode, depth_level, token_info)
-
-            # Generate a unique correlation_id for each subscription
-            # This allows multiple clients to subscribe to the same symbol
-            import uuid
-            unique_id = str(uuid.uuid4())[:8]
-            correlation_id = f"{symbol}_{exchange}_{mode}_{unique_id}"
-
-            # Check if we need to subscribe to WebSocket
-            base_correlation_id = f"{symbol}_{exchange}_{mode}"
-            already_ws_subscribed = any(
-                cid.startswith(base_correlation_id)
-                for cid in self.subscriptions.keys()
-            )
-
-            if already_ws_subscribed:
-                self.logger.info(f"[SUBSCRIBE] WebSocket already subscribed for {base_correlation_id}, adding client subscription {correlation_id}")
-            else:
-                self.logger.info(f"[SUBSCRIBE] New WebSocket subscription needed for {correlation_id}")
-
-            # Always store the subscription (each client gets their own entry)
+            correlation_id = f"{symbol}_{exchange}_{mode}"
+            
+            # Store subscription and update mappings
             self._store_subscription(correlation_id, subscription)
-
-            # Subscribe via WebSocket (reference counting will handle duplicates)
+            
+            # Subscribe via WebSocket
             if self.connected:
                 self._websocket_subscribe(subscription)
-                if not already_ws_subscribed:
-                    self.logger.info(f"[SUBSCRIBE] WebSocket subscription sent for {subscription['scrip']}")
-            else:
-                self.logger.warning(f"[SUBSCRIBE] Not connected, cannot subscribe to {subscription['scrip']}")
-
-            # Log current ZMQ port and subscription state
-            self.logger.info(f"[SUBSCRIBE] Publishing to ZMQ port: {self.zmq_port}")
-            self.logger.info(f"[SUBSCRIBE] Total active subscriptions: {len(self.subscriptions)}")
-
-            return self._create_success_response(f'Subscribed to {symbol}.{exchange}',
+            
+            return self._create_success_response(f'Subscribed to {symbol}.{exchange}', 
                                                symbol=symbol, exchange=exchange, mode=mode)
-
+        
         except Exception as e:
             self.logger.error(f"Subscription error for {symbol}.{exchange}: {e}")
             return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
 
     def unsubscribe(self, symbol: str, exchange: str, mode: int = Config.MODE_QUOTE) -> Dict[str, Any]:
         """Unsubscribe from market data"""
-        base_correlation_id = f"{symbol}_{exchange}_{mode}"
-
+        correlation_id = f"{symbol}_{exchange}_{mode}"
+        
         with self.lock:
-            # Find the first matching subscription for this client
-            matching_subscriptions = [
-                (cid, sub) for cid, sub in self.subscriptions.items()
-                if cid.startswith(base_correlation_id)
-            ]
-
-            if not matching_subscriptions:
-                return self._create_error_response("NOT_SUBSCRIBED",
+            if correlation_id not in self.subscriptions:
+                return self._create_error_response("NOT_SUBSCRIBED", 
                                                   f"Not subscribed to {symbol}.{exchange}")
-
-            # Remove the first matching subscription
-            correlation_id, subscription = matching_subscriptions[0]
-
-            # Check if this is the last subscription for this symbol/exchange/mode
-            is_last = len(matching_subscriptions) == 1
-
-            # Remove the subscription
-            del self.subscriptions[correlation_id]
-
-            # Clean up token mapping if no other subscriptions use it
-            token = subscription['token']
-            if not any(sub['token'] == token for sub in self.subscriptions.values()):
-                self.token_to_symbol.pop(token, None)
-
-            # Only unsubscribe from WebSocket if this was the last subscription
-            if is_last:
-                scrip = subscription['scrip']
-                if scrip in self.ws_subscription_refs:
-                    if mode in [Config.MODE_LTP, Config.MODE_QUOTE]:
-                        self.ws_subscription_refs[scrip]['touchline_count'] -= 1
-                        if self.ws_subscription_refs[scrip]['touchline_count'] <= 0:
-                            self._websocket_unsubscribe(subscription)
-                    elif mode == Config.MODE_DEPTH:
-                        self.ws_subscription_refs[scrip]['depth_count'] -= 1
-                        if self.ws_subscription_refs[scrip]['depth_count'] <= 0:
-                            self._websocket_unsubscribe(subscription)
-
+            
+            subscription = self.subscriptions[correlation_id]
+            self._websocket_unsubscribe(subscription)
+            self._remove_subscription(correlation_id, subscription)
+        
         return self._create_success_response(
             f"Unsubscribed from {symbol}.{exchange}",
             symbol=symbol, exchange=exchange, mode=mode
@@ -496,29 +437,21 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Handle WebSocket subscription with reference counting"""
         scrip = subscription['scrip']
         mode = subscription['mode']
-
+        
         # Initialize reference count for this scrip if not exists
         if scrip not in self.ws_subscription_refs:
             self.ws_subscription_refs[scrip] = {'touchline_count': 0, 'depth_count': 0}
-
+        
         if mode in [Config.MODE_LTP, Config.MODE_QUOTE]:
             if self.ws_subscription_refs[scrip]['touchline_count'] == 0:
                 self.logger.info(f"First touchline subscription for {scrip}")
                 self.ws_client.subscribe_touchline(scrip)
-                self.ws_subscription_refs[scrip]['touchline_count'] = 1
-            else:
-                # Already subscribed, just increment the count
-                self.ws_subscription_refs[scrip]['touchline_count'] += 1
-                self.logger.info(f"Additional touchline subscription for {scrip}, count: {self.ws_subscription_refs[scrip]['touchline_count']}")
+            self.ws_subscription_refs[scrip]['touchline_count'] += 1
         elif mode == Config.MODE_DEPTH:
             if self.ws_subscription_refs[scrip]['depth_count'] == 0:
                 self.logger.info(f"First depth subscription for {scrip}")
                 self.ws_client.subscribe_depth(scrip)
-                self.ws_subscription_refs[scrip]['depth_count'] = 1
-            else:
-                # Already subscribed, just increment the count
-                self.ws_subscription_refs[scrip]['depth_count'] += 1
-                self.logger.info(f"Additional depth subscription for {scrip}, count: {self.ws_subscription_refs[scrip]['depth_count']}")
+            self.ws_subscription_refs[scrip]['depth_count'] += 1
 
     def _websocket_unsubscribe(self, subscription: Dict) -> None:
         """Handle WebSocket unsubscription with reference counting"""
@@ -545,33 +478,16 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Remove subscription and clean up mappings"""
         token = subscription['token']
         scrip = subscription['scrip']
-        mode = subscription['mode']
-
+        
         # Remove subscription
         del self.subscriptions[correlation_id]
-
-        # Check if there are any other subscriptions for the same scrip and mode
-        has_other_subscriptions = any(
-            sub['scrip'] == scrip and sub['mode'] == mode
-            for sub in self.subscriptions.values()
-        )
-
-        # Only decrement reference count if no other subscriptions exist
-        if not has_other_subscriptions and scrip in self.ws_subscription_refs:
-            if mode in [Config.MODE_LTP, Config.MODE_QUOTE]:
-                self.ws_subscription_refs[scrip]['touchline_count'] -= 1
-                if self.ws_subscription_refs[scrip]['touchline_count'] <= 0:
-                    self.ws_subscription_refs[scrip]['touchline_count'] = 0
-            elif mode == Config.MODE_DEPTH:
-                self.ws_subscription_refs[scrip]['depth_count'] -= 1
-                if self.ws_subscription_refs[scrip]['depth_count'] <= 0:
-                    self.ws_subscription_refs[scrip]['depth_count'] = 0
-
-            # Clean up reference count if both counts are 0
-            if (self.ws_subscription_refs[scrip]['touchline_count'] <= 0 and
+        
+        # Clean up reference count if both counts are 0
+        if scrip in self.ws_subscription_refs:
+            if (self.ws_subscription_refs[scrip]['touchline_count'] <= 0 and 
                 self.ws_subscription_refs[scrip]['depth_count'] <= 0):
                 del self.ws_subscription_refs[scrip]
-
+        
         # Remove token mapping if no other subscriptions use it
         if not any(sub['token'] == token for sub in self.subscriptions.values()):
             self.token_to_symbol.pop(token, None)
@@ -649,38 +565,36 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         with self.lock:
             # Reset reference counts
             self.ws_subscription_refs = {}
-
+            
             # Collect unique scrips for each subscription type
             touchline_scrips = set()
             depth_scrips = set()
-
+            
             for subscription in self.subscriptions.values():
                 scrip = subscription['scrip']
                 mode = subscription['mode']
-
+                
                 # Initialize reference count
                 if scrip not in self.ws_subscription_refs:
                     self.ws_subscription_refs[scrip] = {'touchline_count': 0, 'depth_count': 0}
-
+                
                 if mode in [Config.MODE_LTP, Config.MODE_QUOTE]:
-                    if scrip not in touchline_scrips:
-                        touchline_scrips.add(scrip)
+                    touchline_scrips.add(scrip)
                     self.ws_subscription_refs[scrip]['touchline_count'] += 1
                 elif mode == Config.MODE_DEPTH:
-                    if scrip not in depth_scrips:
-                        depth_scrips.add(scrip)
+                    depth_scrips.add(scrip)
                     self.ws_subscription_refs[scrip]['depth_count'] += 1
-
+            
             # Resubscribe in batches
             if touchline_scrips:
                 scrip_list = '#'.join(touchline_scrips)
                 self.ws_client.subscribe_touchline(scrip_list)
-                self.logger.info(f"Resubscribed to {len(touchline_scrips)} touchline scrips with total {sum(self.ws_subscription_refs[s]['touchline_count'] for s in touchline_scrips)} subscriptions")
-
+                self.logger.info(f"Resubscribed to {len(touchline_scrips)} touchline scrips")
+            
             if depth_scrips:
                 scrip_list = '#'.join(depth_scrips)
                 self.ws_client.subscribe_depth(scrip_list)
-                self.logger.info(f"Resubscribed to {len(depth_scrips)} depth scrips with total {sum(self.ws_subscription_refs[s]['depth_count'] for s in depth_scrips)} subscriptions")
+                self.logger.info(f"Resubscribed to {len(depth_scrips)} depth scrips")
 
     def _on_message(self, ws, message):
         """Handle incoming market data messages"""
@@ -758,43 +672,39 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Process message for a specific subscription"""
         mode = subscription['mode']
         msg_type = data.get('t')
-
+        
         # Normalize data
         normalized_data = self._normalize_market_data(data, msg_type, mode)
         normalized_data.update({
             'symbol': symbol,
             'exchange': exchange,
+            'broker': self.broker_name,
             'timestamp': int(time.time() * 1000)
         })
-
-        # Create topic and publish
-        mode_str = {Config.MODE_LTP: 'LTP', Config.MODE_QUOTE: 'QUOTE', Config.MODE_DEPTH: 'DEPTH'}[mode]
-        topic = f"{exchange}_{symbol}_{mode_str}"
-
-        # Get client count for this subscription
-        client_count = subscription.get('client_count', 1)
-
-        self.logger.debug(f"[PUBLISH] Publishing {mode_str} data for {symbol} on topic: {topic}, ZMQ port: {self.zmq_port}, client_count: {client_count}")
-
-        # Debug: Check if data is actually being sent
-        try:
-            # Track published topics
-            if not hasattr(self, '_published_topics'):
-                self._published_topics = set()
-
-            if topic not in self._published_topics:
-                self.logger.info(f"[PUBLISH] First publish for topic: {topic}")
-                self._published_topics.add(topic)
-
-            # Publish once - the ZMQ PUB/SUB pattern will deliver to all subscribers
-            # The issue is not here but in how subscriptions are found
-            self.publish_market_data(topic, normalized_data)
-
-            # Log client count for debugging
-            if client_count > 1:
-                self.logger.debug(f"[PUBLISH] Published to topic {topic} for {client_count} clients")
-        except Exception as e:
-            self.logger.error(f"[PUBLISH] Failed to publish data: {e}")
+        
+        # Add broker timestamp for latency measurement
+        broker_timestamp_ms = time.time() * 1000
+        normalized_data['broker_timestamp'] = broker_timestamp_ms
+        
+        # Publish to zero-backpressure proxy
+        self.logger.debug(f"[FLATTRADE] About to publish {symbol}, zbp_proxy={self.zbp_proxy is not None}")
+        
+        if self.zbp_proxy:
+            if hasattr(self.zbp_proxy, 'publish_market_data'):
+                self.logger.debug(f"[FLATTRADE] Calling publish_market_data for {symbol}")
+                try:
+                    success = self.zbp_proxy.publish_market_data(symbol, normalized_data)
+                    if success:
+                        mode_str = {Config.MODE_LTP: 'LTP', Config.MODE_QUOTE: 'QUOTE', Config.MODE_DEPTH: 'DEPTH'}[mode]
+                        self.logger.debug(f"Published {symbol} data: LTP={normalized_data.get('ltp', 'N/A')}, Mode={mode_str}, Broker_TS={broker_timestamp_ms}")
+                    else:
+                        self.logger.warning(f"Failed to publish market data for {symbol}")
+                except Exception as e:
+                    self.logger.error(f"Exception calling publish_market_data for {symbol}: {e}", exc_info=True)
+            else:
+                self.logger.error(f"zbp_proxy does not have publish_market_data method! Type: {type(self.zbp_proxy)}")
+        else:
+            self.logger.warning("Zero-backpressure proxy not available")
 
     def _normalize_market_data(self, data: Dict[str, Any], msg_type: str, mode: int) -> Dict[str, Any]:
         """Normalize market data based on mode with improved structure"""
@@ -818,6 +728,37 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def clear_market_data_cache(self, token: str = None) -> None:
         """Clear market data cache"""
         self.market_cache.clear(token)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get adapter statistics"""
+        return {
+            'broker': self.broker_name,
+            'connected': self.connected,
+            'running': self.running,
+            'subscriptions': len(self.subscriptions),
+            'reconnect_attempts': self.reconnect_attempts,
+            'cache_stats': self.get_market_data_cache_stats(),
+            'ws_subscriptions': len(self.ws_subscription_refs) if hasattr(self, 'ws_subscription_refs') else 0
+        }
+
+    def cleanup(self) -> None:
+        """Clean up adapter resources"""
+        try:
+            self.disconnect()
+            self.market_cache.clear()
+            self.logger.info("Flattrade adapter cleanup completed")
+        except Exception as e:
+            self.logger.error(f"Error during Flattrade adapter cleanup: {e}")
+
+    def _create_success_response(self, message: str, **kwargs) -> Dict[str, Any]:
+        """Create standardized success response"""
+        response = {"status": "success", "message": message}
+        response.update(kwargs)
+        return response
+
+    def _create_error_response(self, code: str, message: str) -> Dict[str, Any]:
+        """Create standardized error response"""
+        return {"status": "error", "code": code, "message": message}
 
 
 # Utility functions
