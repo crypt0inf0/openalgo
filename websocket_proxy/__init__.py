@@ -49,6 +49,13 @@ except ImportError:
     logger.debug("Angel adapter not available")
 
 try:
+    from broker.dhan.streaming.dhan_adapter import DhanWebSocketAdapter
+    register_adapter("dhan", DhanWebSocketAdapter)
+    logger.info("Registered dhan adapter")
+except ImportError:
+    logger.debug("Dhan adapter not available")
+
+try:
     from broker.flattrade.streaming.flattrade_adapter import FlattradeWebSocketAdapter
     register_adapter("flattrade", FlattradeWebSocketAdapter)
     logger.info("Registered Flattrade adapter")

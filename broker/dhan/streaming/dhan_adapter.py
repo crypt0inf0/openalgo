@@ -21,8 +21,8 @@ import os
 # Add parent directory to path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../'))
 
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
-from websocket_proxy.mapping import SymbolMapper
+from websocket_proxy.adapters.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy.adapters.mapping import SymbolMapper
 from .dhan_mapping import DhanExchangeMapper, DhanCapabilityRegistry
 from .dhan_websocket import DhanWebSocket
 
@@ -63,7 +63,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 10
     
-    def initialize(self, broker_name: str, user_id: str, auth_data: Optional[Dict[str, str]] = None) -> None:
+    def initialize(self, broker_name: str, user_id: str, auth_data: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Initialize connection with Dhan WebSocket API
         
@@ -72,83 +72,102 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             user_id: Client ID/user ID
             auth_data: If provided, use these credentials instead of fetching from DB
         """
-        self.user_id = user_id
-        self.broker_name = broker_name
-        
-        # For Dhan, use credentials from .env file and database
-        import os
-        from dotenv import load_dotenv
-        load_dotenv()
+        try:
+            self.user_id = user_id
+            self.broker_name = broker_name
+            
+            # For Dhan, use credentials from .env file and database
+            import os
+            from dotenv import load_dotenv
+            load_dotenv()
 
-        # Get Dhan client_id from BROKER_API_KEY (format: client_id:::api_key)
-        broker_api_key = os.getenv('BROKER_API_KEY')
-        if broker_api_key and ':::' in broker_api_key:
-            client_id = broker_api_key.split(':::')[0]
-        else:
-            client_id = broker_api_key or user_id
+            # Get Dhan client_id from BROKER_API_KEY (format: client_id:::api_key)
+            broker_api_key = os.getenv('BROKER_API_KEY')
+            if broker_api_key and ':::' in broker_api_key:
+                client_id = broker_api_key.split(':::')[0]
+            else:
+                client_id = broker_api_key or user_id
 
-        # Get OAuth access token from database (NOT from BROKER_API_SECRET)
-        # BROKER_API_SECRET is the OAuth app secret, not the access token
-        if not auth_data:
-            auth_token = get_auth_token(user_id)
-            if not auth_token:
-                self.logger.error(f"No OAuth access token found in database for user {user_id}")
-                raise ValueError(f"No OAuth access token found for user {user_id}")
-        else:
-            auth_token = auth_data.get('auth_token')
-            if not auth_token:
-                self.logger.error("Missing required authentication data")
-                raise ValueError("Missing required authentication data")
+            # Get OAuth access token from database (NOT from BROKER_API_SECRET)
+            # BROKER_API_SECRET is the OAuth app secret, not the access token
+            if not auth_data:
+                auth_token = get_auth_token(user_id)
+                if not auth_token:
+                    error_msg = f"No OAuth access token found in database for user {user_id}"
+                    self.logger.error(error_msg)
+                    return self._create_error_response("MISSING_CREDENTIALS", error_msg)
+            else:
+                auth_token = auth_data.get('auth_token')
+                if not auth_token:
+                    error_msg = "Missing required authentication data"
+                    self.logger.error(error_msg)
+                    return self._create_error_response("MISSING_CREDENTIALS", error_msg)
 
-        self.logger.debug(f"Using Dhan credentials - Client ID: {client_id}")
-        
-        # Store the client_id for later use
-        self.client_id = client_id
-        
-        # Initialize 5-depth WebSocket client
-        self.ws_client_5depth = DhanWebSocket(
-            client_id=client_id,  # Use the actual Dhan client ID
-            access_token=auth_token,
-            is_20_depth=False
-        )
-        
-        # Initialize 20-depth WebSocket client
-        self.ws_client_20depth = DhanWebSocket(
-            client_id=client_id,  # Use the actual Dhan client ID
-            access_token=auth_token,
-            is_20_depth=True
-        )
-        
-        # Set callbacks for 5-depth client
-        self.ws_client_5depth.on_open = self._on_open_5depth
-        self.ws_client_5depth.on_data = self._on_data_5depth
-        self.ws_client_5depth.on_error = self._on_error_5depth
-        self.ws_client_5depth.on_close = self._on_close_5depth
-        
-        # Set callbacks for 20-depth client
-        self.ws_client_20depth.on_open = self._on_open_20depth
-        self.ws_client_20depth.on_data = self._on_data_20depth
-        self.ws_client_20depth.on_error = self._on_error_20depth
-        self.ws_client_20depth.on_close = self._on_close_20depth
-        
-        self.running = True
-        
-        # Start fallback monitoring thread - temporarily disabled for debugging
-        # self.start_fallback_monitor()
+            self.logger.debug(f"Using Dhan credentials - Client ID: {client_id}")
+            
+            # Store the client_id for later use
+            self.client_id = client_id
+            
+            # Initialize 5-depth WebSocket client
+            self.ws_client_5depth = DhanWebSocket(
+                client_id=client_id,  # Use the actual Dhan client ID
+                access_token=auth_token,
+                is_20_depth=False
+            )
+            
+            # Initialize 20-depth WebSocket client
+            self.ws_client_20depth = DhanWebSocket(
+                client_id=client_id,  # Use the actual Dhan client ID
+                access_token=auth_token,
+                is_20_depth=True
+            )
+            
+            # Set callbacks for 5-depth client
+            self.ws_client_5depth.on_open = self._on_open_5depth
+            self.ws_client_5depth.on_data = self._on_data_5depth
+            self.ws_client_5depth.on_error = self._on_error_5depth
+            self.ws_client_5depth.on_close = self._on_close_5depth
+            
+            # Set callbacks for 20-depth client
+            self.ws_client_20depth.on_open = self._on_open_20depth
+            self.ws_client_20depth.on_data = self._on_data_20depth
+            self.ws_client_20depth.on_error = self._on_error_20depth
+            self.ws_client_20depth.on_close = self._on_close_20depth
+            
+            self.running = True
+            
+            # Start fallback monitoring thread - temporarily disabled for debugging
+            # self.start_fallback_monitor()
+            
+            return self._create_success_response(f"Dhan adapter initialized for user {user_id}")
+            
+        except Exception as e:
+            error_msg = f"Failed to initialize Dhan adapter: {e}"
+            self.logger.error(error_msg)
+            return self._create_error_response("INIT_ERROR", error_msg)
     
-    def connect(self) -> None:
+    def connect(self) -> Dict[str, Any]:
         """Establish connections to Dhan WebSocket endpoints"""
         if not self.ws_client_5depth or not self.ws_client_20depth:
-            self.logger.error("WebSocket clients not initialized. Call initialize() first.")
-            return
+            error_msg = "WebSocket clients not initialized. Call initialize() first."
+            self.logger.error(error_msg)
+            return self._create_error_response("NOT_INITIALIZED", error_msg)
         
-        # Connect to 5-depth endpoint
-        self.logger.debug("Connecting to Dhan 5-depth WebSocket...")
-        self.ws_client_5depth.connect()
-        
-        # Connect to 20-depth endpoint
-        self.logger.debug("Connecting to Dhan 20-depth WebSocket...")
-        self.ws_client_20depth.connect()
+        try:
+            # Connect to 5-depth endpoint
+            self.logger.debug("Connecting to Dhan 5-depth WebSocket...")
+            self.ws_client_5depth.connect()
+            
+            # Connect to 20-depth endpoint
+            self.logger.debug("Connecting to Dhan 20-depth WebSocket...")
+            self.ws_client_20depth.connect()
+            
+            return self._create_success_response("Connected to Dhan WebSocket endpoints")
+            
+        except Exception as e:
+            error_msg = f"Connection error: {e}"
+            self.logger.error(error_msg)
+            return self._create_error_response("CONNECTION_ERROR", error_msg)
     
     def disconnect(self) -> None:
         """Disconnect from Dhan WebSocket endpoints"""
@@ -159,9 +178,6 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         
         if self.ws_client_20depth:
             self.ws_client_20depth.disconnect()
-        
-        # Clean up ZeroMQ resources
-        self.cleanup_zmq()
         
         # Stop fallback monitor
         self.stop_fallback_monitor()
@@ -430,8 +446,6 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             except Exception as e:
                 self.logger.error(f"Error disconnecting 20-depth WebSocket: {e}")
 
-        # Clean up ZeroMQ resources
-        self.cleanup_zmq()
         self.logger.info(f"Dhan adapter disconnected and cleaned up after unsubscribing {unsubscribed_count} instruments")
 
         return self._create_success_response(
@@ -521,9 +535,13 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 }
                 
                 mode_str = mode_map.get(data_type, 'UNKNOWN')
-                topic = f"{exchange}_{symbol}_{mode_str}"
                 
-                self.publish_market_data(topic, market_data)
+                # Add broker timestamp for latency measurement
+                broker_timestamp_ms = time.time() * 1000
+                market_data['broker_timestamp'] = broker_timestamp_ms
+                market_data['broker'] = self.broker_name
+                
+                self.publish_market_data(symbol, exchange, market_data)
                 
         except Exception as e:
             self.logger.error(f"Error processing 5-depth data: {e}", exc_info=True)
@@ -606,9 +624,13 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     'depth_level': 20
                 }
                 
-                # Publish with standard DEPTH topic (mode 3)
-                topic = f"{exchange}_{symbol}_DEPTH"
-                self.publish_market_data(topic, market_data)
+                # Add broker timestamp for latency measurement
+                broker_timestamp_ms = time.time() * 1000
+                market_data['broker_timestamp'] = broker_timestamp_ms
+                market_data['broker'] = self.broker_name
+                
+                # Publish with standard DEPTH format (mode 3)
+                self.publish_market_data(symbol, exchange, market_data)
                 
                 # Clear accumulator
                 del self.depth_20_accumulator[security_id]
@@ -782,3 +804,35 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             
         except Exception as e:
             self.logger.error(f"Error performing fallback for {correlation_id}: {e}", exc_info=True)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get adapter statistics"""
+        return {
+            'broker': self.broker_name,
+            'connected_5depth': self.ws_client_5depth.connected if self.ws_client_5depth else False,
+            'connected_20depth': self.ws_client_20depth.connected if self.ws_client_20depth else False,
+            'running': self.running,
+            'subscriptions_5depth': len(self.subscriptions_5depth),
+            'subscriptions_20depth': len(self.subscriptions_20depth),
+            'depth_20_fallbacks': len(self.depth_20_fallbacks),
+            'depth_20_accumulator': len(self.depth_20_accumulator),
+            'reconnect_attempts': self.reconnect_attempts
+        }
+
+    def cleanup(self) -> None:
+        """Clean up adapter resources"""
+        try:
+            self.disconnect()
+            self.logger.info("Dhan adapter cleanup completed")
+        except Exception as e:
+            self.logger.error(f"Error during Dhan adapter cleanup: {e}")
+
+    def _create_success_response(self, message: str, **kwargs) -> Dict[str, Any]:
+        """Create standardized success response"""
+        response = {"status": "success", "message": message}
+        response.update(kwargs)
+        return response
+
+    def _create_error_response(self, code: str, message: str) -> Dict[str, Any]:
+        """Create standardized error response"""
+        return {"status": "error", "code": code, "message": message}
