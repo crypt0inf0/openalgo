@@ -55,6 +55,13 @@ try:
 except ImportError:
     logger.debug("Flattrade adapter not available")
 
+try:
+    from broker.fyers.streaming.fyers_adapter import FyersWebSocketAdapter
+    register_adapter("fyers", FyersWebSocketAdapter)
+    logger.info("Registered Fyers adapter")
+except ImportError:
+    logger.debug("Fyers adapter not available")
+
 __version__ = "2.1.0"
 __all__ = [
     # Core components

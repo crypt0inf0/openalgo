@@ -1,459 +1,199 @@
 """
-Fyers Data Mapping
-Maps Fyers HSM data to OpenAlgo format for compatibility
+Fyers-specific mapping utilities for the WebSocket adapter - Updated to use brsymbol
 """
+from typing import Dict, Set, Optional
 
-import time
-from typing import Dict, Any, Optional
-from datetime import datetime
+class FyersExchangeMapper:
+    """Maps between OpenAlgo exchange names and Fyers exchange codes"""
+    
+    # OpenAlgo to Fyers exchange mapping (based on Fyers SDK exch_seg_dict)
+    EXCHANGE_MAP = {
+        'NSE': 'NSE',
+        'BSE': 'BSE', 
+        'NFO': 'NFO',
+        'BFO': 'BFO',
+        'MCX': 'MCX',
+        'CDS': 'CDS',
+        'NSE_INDEX': 'NSE',  # Indices use base exchange
+        'BSE_INDEX': 'BSE'
+    }
+    
+    # Fyers internal segment codes (from SDK)
+    FYERS_SEGMENT_CODES = {
+        'NSE': '1010',    # NSE CM
+        'NFO': '1011',    # NSE FO
+        'BSE': '1210',    # BSE CM
+        'BFO': '1211',    # BSE FO
+        'MCX': '1120',    # MCX FO
+        'CDS': '1012',    # Currency derivatives
+        'CDE': '1012',    # Currency derivatives exchange
+        'BCS': '1212',    # BSE currency segment
+        'NSE_COM': '1020' # NSE commodity
+    }
+    
+    # Reverse mapping
+    FYERS_TO_OPENALGO = {v: k for k, v in EXCHANGE_MAP.items()}
+    
+    @classmethod
+    def to_fyers_exchange(cls, oa_exchange: str) -> Optional[str]:
+        """Convert OpenAlgo exchange to Fyers exchange format"""
+        return cls.EXCHANGE_MAP.get(oa_exchange.upper())
+    
+    @classmethod
+    def to_oa_exchange(cls, fyers_exchange: str) -> Optional[str]:
+        """Convert Fyers exchange to OpenAlgo exchange format"""
+        return cls.FYERS_TO_OPENALGO.get(fyers_exchange.upper())
+    
+    @classmethod
+    def get_segment_code(cls, exchange: str) -> Optional[str]:
+        """Get Fyers segment code for exchange"""
+        return cls.FYERS_SEGMENT_CODES.get(exchange.upper())
 
-class FyersDataMapper:
-    """
-    Maps Fyers HSM WebSocket data to OpenAlgo format
-    """
+
+class FyersCapabilityRegistry:
+    """Registry for Fyers-specific capabilities and limits"""
     
-    def __init__(self):
-        """Initialize the data mapper"""
-        pass
+    # Supported subscription modes (from SDK data_type options)
+    SUPPORTED_MODES = {1, 2, 3}  # LTP, Quote, Depth
     
-    def map_to_openalgo_ltp(self, fyers_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Map Fyers data to OpenAlgo LTP format
-        
-        Args:
-            fyers_data: Raw data from Fyers HSM WebSocket
-            
-        Returns:
-            OpenAlgo LTP format dict or None if mapping fails
-        """
-        try:
-            if not fyers_data or "ltp" not in fyers_data:
-                return None
-            
-            # Get the symbol - prefer original_symbol if available
-            symbol = fyers_data.get("original_symbol") or fyers_data.get("symbol", "")
-            
-            # Parse exchange and symbol from original_symbol (e.g., "BSE:TCS-A")
-            if ":" in symbol:
-                exchange, symbol_name = symbol.split(":", 1)
-                # Clean symbol name for consistent display (remove suffixes like -EQ, -A, etc.)
-                if "-" in symbol_name:
-                    symbol_name = symbol_name.split("-")[0]
-            else:
-                exchange = fyers_data.get("exchange", "")
-                symbol_name = symbol
-            
-            print(f"LTP Mapping: original_symbol={symbol}, parsed exchange={exchange}, symbol_name={symbol_name}")
-            
-            # Apply multiplier and precision to LTP
-            ltp = fyers_data.get("ltp", 0)
-            multiplier = fyers_data.get("multiplier", 100)  # Default 100
-            precision = fyers_data.get("precision", 2)     # Default 2
-            
-            # Apply segment-specific conversion
-            segment_divisor = 1
-            if exchange in ["BSE", "MCX", "NSE", "NFO"]:
-                segment_divisor = 100  # These exchanges send prices in paisa/paise format
-            
-            # Convert to actual price
-            if multiplier > 0:
-                ltp = ltp / multiplier / segment_divisor
-            
-            # Round to precision
-            ltp = round(ltp, precision)
-            
-            # Map to OpenAlgo LTP format
-            openalgo_data = {
-                "symbol": f"{exchange}:{symbol_name}",
-                "exchange": exchange,
-                "token": fyers_data.get("exchange_token", ""),
-                "ltp": ltp,
-                "timestamp": int(time.time()),
-                "data_type": "LTP"
-            }
-            
-            return openalgo_data
-            
-        except Exception as e:
-            print(f"Error mapping LTP data: {e}")
-            return None
+    # Fyers data types from SDK
+    DATA_TYPES = {
+        'SymbolUpdate': 'SymbolUpdate',
+        'DepthUpdate': 'DepthUpdate'
+    }
     
-    def map_to_openalgo_quote(self, fyers_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Map Fyers data to OpenAlgo Quote format
-        
-        Args:
-            fyers_data: Raw data from Fyers HSM WebSocket
-            
-        Returns:
-            OpenAlgo Quote format dict or None if mapping fails
-        """
-        try:
-            if not fyers_data:
-                return None
-            
-            # Get the symbol
-            symbol = fyers_data.get("original_symbol") or fyers_data.get("symbol", "")
-            
-            # Parse exchange and symbol
-            if ":" in symbol:
-                exchange, symbol_name = symbol.split(":", 1)
-                # Clean symbol name for consistent display (remove suffixes like -EQ, -A, etc.)
-                if "-" in symbol_name:
-                    symbol_name = symbol_name.split("-")[0]
-            else:
-                exchange = fyers_data.get("exchange", "")
-                symbol_name = symbol
-            
-            
-            # Get multiplier and precision from data
-            multiplier = fyers_data.get("multiplier", 100)
-            precision = fyers_data.get("precision", 2)
-            
-            # Check if this is an index based on symbol or type
-            is_index = (
-                "-INDEX" in symbol or 
-                "-INDEX" in symbol.upper() or
-                "INDEX" in symbol.upper() or
-                fyers_data.get("type") == "if"  # Index feed type in HSM
-            )
-            
-            # Apply segment-specific conversion
-            segment_divisor = 1
-            if not is_index and exchange in ["BSE", "MCX", "NSE", "NFO"]:
-                segment_divisor = 100  # These exchanges send prices in paisa/paise format
-            
-            def convert_price(value):
-                if not value or multiplier <= 0:
-                    return 0.0
-                # Apply multiplier and segment conversion
-                return round(value / multiplier / segment_divisor, precision)
-            
-            # Map to OpenAlgo Quote format
-            openalgo_data = {
-                "symbol": f"{exchange}:{symbol_name}",
-                "exchange": exchange,
-                "token": fyers_data.get("exchange_token", ""),
-                "ltp": convert_price(fyers_data.get("ltp", 0)),
-                "open": convert_price(fyers_data.get("open_price", 0)),
-                "high": convert_price(fyers_data.get("high_price", 0)),
-                "low": convert_price(fyers_data.get("low_price", 0)),
-                "close": convert_price(fyers_data.get("prev_close_price", 0)),
-                "bid_price": convert_price(fyers_data.get("bid_price", 0)),
-                "ask_price": convert_price(fyers_data.get("ask_price", 0)),
-                "bid_size": fyers_data.get("bid_size", 0),
-                "ask_size": fyers_data.get("ask_size", 0),
-                "volume": fyers_data.get("vol_traded_today", 0),
-                "oi": fyers_data.get("OI", 0),
-                "upper_circuit": convert_price(fyers_data.get("upper_ckt", 0)),
-                "lower_circuit": convert_price(fyers_data.get("lower_ckt", 0)),
-                "last_traded_time": fyers_data.get("last_traded_time", 0),
-                "exchange_time": fyers_data.get("exch_feed_time", 0),
-                "average_price": convert_price(fyers_data.get("avg_trade_price", 0)),
-                "total_buy_quantity": fyers_data.get("tot_buy_qty", 0),
-                "total_sell_quantity": fyers_data.get("tot_sell_qty", 0),
-                "timestamp": int(time.time()),
-                "data_type": "Quote"
-            }
-            
-            return openalgo_data
-            
-        except Exception as e:
-            print(f"Error mapping Quote data: {e}")
-            return None
+    # Maximum subscriptions per connection (from SDK)
+    MAX_SUBSCRIPTIONS = 5000
     
-    def map_to_openalgo_depth(self, fyers_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Map Fyers depth data to OpenAlgo Depth format
-        
-        Args:
-            fyers_data: Raw depth data from Fyers HSM WebSocket
-            
-        Returns:
-            OpenAlgo Depth format dict or None if mapping fails
-        """
-        try:
-            if not fyers_data or fyers_data.get("type") != "dp":
-                return None
-            
-            # Get the symbol
-            symbol = fyers_data.get("original_symbol") or fyers_data.get("symbol", "")
-            
-            # Parse exchange and symbol
-            if ":" in symbol:
-                exchange, symbol_name = symbol.split(":", 1)
-                # Clean symbol name for consistent display (remove suffixes like -EQ, -A, etc.)
-                if "-" in symbol_name:
-                    symbol_name = symbol_name.split("-")[0]
-            else:
-                exchange = fyers_data.get("exchange", "")
-                symbol_name = symbol
-            
-            # Apply multiplier and precision
-            multiplier = fyers_data.get("multiplier", 100)
-            precision = fyers_data.get("precision", 2)
-            
-            # Apply segment-specific conversion based on exchange
-            segment_divisor = 1
-            if exchange == "BSE":
-                segment_divisor = 100  # BSE prices are in paisa
-            elif exchange == "MCX":
-                segment_divisor = 100  # MCX also needs division by 100
-            elif exchange == "NSE":
-                segment_divisor = 100  # NSE prices also in paisa format
-            elif exchange == "NFO":
-                segment_divisor = 100  # NFO prices also in paisa format
-            
-            def convert_price(value):
-                if value and multiplier > 0:
-                    # First apply the multiplier conversion, then segment-specific conversion
-                    price = value / multiplier / segment_divisor
-                    return round(price, precision)
-                return 0.0
-            
-            # Build buy and sell arrays (matching other brokers' format)
-            buy_levels = []
-            sell_levels = []
-            
-            for i in range(1, 6):  # 5 levels
-                bid_price = convert_price(fyers_data.get(f"bid_price{i}", 0))
-                bid_size = fyers_data.get(f"bid_size{i}", 0)
-                bid_orders = fyers_data.get(f"bid_order{i}", 0)
-                
-                ask_price = convert_price(fyers_data.get(f"ask_price{i}", 0))
-                ask_size = fyers_data.get(f"ask_size{i}", 0)
-                ask_orders = fyers_data.get(f"ask_order{i}", 0)
-                
-                if bid_price > 0:
-                    buy_levels.append({
-                        "price": bid_price,
-                        "quantity": bid_size,  # Changed from "size" to "quantity"
-                        "orders": bid_orders
-                    })
-                
-                if ask_price > 0:
-                    sell_levels.append({
-                        "price": ask_price,
-                        "quantity": ask_size,  # Changed from "size" to "quantity"
-                        "orders": ask_orders
-                    })
-            
-            # Calculate LTP (average of best bid and ask if available)
-            ltp = 0
-            if buy_levels and sell_levels:
-                ltp = (buy_levels[0]["price"] + sell_levels[0]["price"]) / 2
-            
-            # Map to OpenAlgo Depth format (matching other brokers)
-            openalgo_data = {
-                "symbol": f"{exchange}:{symbol_name}",
-                "exchange": exchange,
-                "token": fyers_data.get("exchange_token", ""),
-                "ltp": ltp,
-                "depth": {
-                    "buy": buy_levels,
-                    "sell": sell_levels
-                },
-                "timestamp": int(time.time()),
-                "data_type": "Depth"
-            }
-            
-            return openalgo_data
-            
-        except Exception as e:
-            print(f"Error mapping Depth data: {e}")
-            return None
+    # Maximum symbols per subscription request
+    MAX_SYMBOLS_PER_REQUEST = 500  # Based on SDK chunking
     
-    def map_index_to_synthetic_depth(self, fyers_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Map Fyers index data to synthetic OpenAlgo Depth format
-        Since indices don't have real depth, create synthetic depth from quote data
-        
-        Args:
-            fyers_data: Raw index data from Fyers HSM WebSocket
-            
-        Returns:
-            OpenAlgo Depth format dict or None if mapping fails
-        """
-        try:
-            if not fyers_data or fyers_data.get("type") != "if":
-                return None
-            
-            # Get the symbol
-            symbol = fyers_data.get("original_symbol") or fyers_data.get("symbol", "")
-            
-            # Parse exchange and symbol
-            if ":" in symbol:
-                exchange, symbol_name = symbol.split(":", 1)
-                # Clean symbol name for consistent display (remove suffixes like -EQ, -A, etc.)
-                if "-" in symbol_name:
-                    symbol_name = symbol_name.split("-")[0]
-            else:
-                exchange = fyers_data.get("exchange", "")
-                symbol_name = symbol
-            
-            print(f"Index Depth Mapping: original_symbol={symbol}, parsed exchange={exchange}, symbol_name={symbol_name}")
-            
-            # Get LTP from index data and apply proper conversion
-            raw_ltp = fyers_data.get("ltp", 0)
-            if not raw_ltp:
-                return None
-            
-            # Apply multiplier and precision conversion for index data
-            multiplier = fyers_data.get("multiplier", 100)
-            precision = fyers_data.get("precision", 2)
-            
-            # For indices, apply proper price conversion
-            if multiplier > 0:
-                ltp = round(raw_ltp / multiplier, precision)
-            else:
-                ltp = raw_ltp
-            
-            # Create synthetic depth levels around LTP
-            # For indices, we'll create small bid-ask spreads around the LTP
-            spread_bps = 5  # 0.05% spread on each side
-            spread = ltp * spread_bps / 10000
-            
-            # Create 5 synthetic bid levels (decreasing prices)
-            buy_levels = []
-            for i in range(5):
-                level_spread = spread * (i + 1)
-                buy_price = round(ltp - level_spread, 2)
-                buy_levels.append({
-                    "price": buy_price,
-                    "quantity": 1000 * (6 - i),  # Higher quantity at better prices
-                    "orders": 1
-                })
-            
-            # Create 5 synthetic ask levels (increasing prices)
-            sell_levels = []
-            for i in range(5):
-                level_spread = spread * (i + 1)
-                ask_price = round(ltp + level_spread, 2)
-                sell_levels.append({
-                    "price": ask_price,
-                    "quantity": 1000 * (6 - i),  # Higher quantity at better prices
-                    "orders": 1
-                })
-            
-            # Map to OpenAlgo Depth format
-            openalgo_data = {
-                "symbol": f"{exchange}:{symbol_name}",
-                "exchange": exchange,
-                "token": fyers_data.get("exchange_token", ""),
-                "ltp": ltp,
-                "depth": {
-                    "buy": buy_levels,
-                    "sell": sell_levels
-                },
-                "timestamp": int(time.time()),
-                "data_type": "Depth"
-            }
-            
-            return openalgo_data
-            
-        except Exception as e:
-            print(f"Error mapping Index to synthetic Depth data: {e}")
-            return None
+    # Supported depth levels (Fyers supports 5-level depth)
+    SUPPORTED_DEPTH_LEVELS = {5}
     
-    def map_fyers_data(self, fyers_data: Dict[str, Any], requested_type: str = "Quote") -> Optional[Dict[str, Any]]:
-        """
-        Map Fyers data to appropriate OpenAlgo format based on requested type
-        
-        Args:
-            fyers_data: Raw data from Fyers HSM WebSocket
-            requested_type: Requested data type ("LTP", "Quote", or "Depth")
-            
-        Returns:
-            Mapped OpenAlgo data or None if mapping fails
-        """
-        if not fyers_data:
-            return None
-        
-        # Determine data type from Fyers data if not specified
-        fyers_type = fyers_data.get("type", "sf")
-        
-        if requested_type == "LTP":
-            return self.map_to_openalgo_ltp(fyers_data)
-        elif requested_type == "Quote":
-            return self.map_to_openalgo_quote(fyers_data)
-        elif requested_type == "Depth" and fyers_type == "dp":
-            return self.map_to_openalgo_depth(fyers_data)
-        elif requested_type == "Depth" and fyers_type == "if":
-            # Index depth request - create synthetic depth from index data
-            return self.map_index_to_synthetic_depth(fyers_data)
-        elif fyers_type == "sf":
-            # Default to Quote for symbol feed
-            return self.map_to_openalgo_quote(fyers_data)
-        elif fyers_type == "if":
-            # Index data - treat as Quote
-            return self.map_to_openalgo_quote(fyers_data)
-        elif fyers_type == "dp":
-            # Depth data
-            return self.map_to_openalgo_depth(fyers_data)
-        
-        return None
+    @classmethod
+    def is_mode_supported(cls, mode: int) -> bool:
+        """Check if a subscription mode is supported"""
+        return mode in cls.SUPPORTED_MODES
     
-    def extract_symbol_info(self, symbol: str) -> Dict[str, str]:
-        """
-        Extract exchange and symbol from OpenAlgo format
-        
-        Args:
-            symbol: Symbol in format "EXCHANGE:SYMBOL" or just "SYMBOL"
-            
-        Returns:
-            Dict with exchange and symbol keys
-        """
-        if ":" in symbol:
-            exchange, symbol_name = symbol.split(":", 1)
-        else:
-            # Default to NSE if no exchange specified
-            exchange = "NSE"
-            symbol_name = symbol
-        
+    @classmethod
+    def is_depth_level_supported(cls, depth_level: int) -> bool:
+        """Check if a depth level is supported"""
+        return depth_level in cls.SUPPORTED_DEPTH_LEVELS
+    
+    @classmethod
+    def get_fallback_depth_level(cls, requested_depth: int) -> int:
+        """Get the fallback depth level (always 5 for Fyers)"""
+        return 5
+    
+    @classmethod
+    def get_capabilities(cls) -> Dict[str, any]:
+        """Get all capabilities"""
         return {
-            "exchange": exchange,
-            "symbol": symbol_name,
-            "full_symbol": f"{exchange}:{symbol_name}"
+            'supported_modes': list(cls.SUPPORTED_MODES),
+            'supported_depth_levels': list(cls.SUPPORTED_DEPTH_LEVELS),
+            'max_subscriptions': cls.MAX_SUBSCRIPTIONS,
+            'max_symbols_per_request': cls.MAX_SYMBOLS_PER_REQUEST,
+            'data_types': list(cls.DATA_TYPES.keys())
         }
+
+
+class FyersSymbolConverter:
+    """Helper class for Fyers symbol conversion logic - Updated to use fytoken-based approach"""
     
-    def is_valid_data(self, data: Dict[str, Any]) -> bool:
+    # Exchange segment codes (first 4 digits of fytoken)
+    EXCHANGE_SEGMENTS = {
+        "1010": "nse_cm",    # NSE Cash Market
+        "1011": "nse_fo",    # NSE F&O
+        "1120": "mcx_fo",    # MCX F&O
+        "1210": "bse_cm",    # BSE Cash Market
+        "1211": "bse_fo",    # BSE F&O (BFO)
+        "1212": "bcs_fo",    # BSE Currency
+        "1012": "cde_fo",    # CDE F&O
+        "1020": "nse_com"    # NSE Commodity
+    }
+    
+    # Known index mappings (from working version)
+    INDEX_MAPPINGS = {
+        "NSE:NIFTY50-INDEX": "Nifty 50",
+        "NSE:NIFTYBANK-INDEX": "Nifty Bank", 
+        "NSE:FINNIFTY-INDEX": "Nifty Fin Service",
+        "NSE:INDIAVIX-INDEX": "India VIX",
+        "NSE:NIFTY100-INDEX": "Nifty 100",
+        "NSE:NIFTYNEXT50-INDEX": "Nifty Next 50",
+        "NSE:NIFTYMIDCAP50-INDEX": "Nifty Midcap 50",
+        "NSE:NIFTYSMLCAP50-INDEX": "NIFTY SMLCAP 50",
+        "BSE:SENSEX-INDEX": "SENSEX",
+        "BSE:BANKEX-INDEX": "BANKEX",
+        "BSE:BSE500-INDEX": "BSE500",
+        "BSE:BSE100-INDEX": "BSE100",
+        "BSE:BSE200-INDEX": "BSE200"
+    }
+    
+    @classmethod
+    def create_hsm_symbol_with_database_token(cls, brsymbol: str, database_token: str, data_type: str) -> Optional[str]:
         """
-        Check if the data contains valid market data
+        Create HSM symbol format using token from database (more efficient than API calls)
         
         Args:
-            data: Market data dictionary
+            brsymbol: Broker symbol format (e.g., NSE:TCS-EQ)
+            database_token: Token from database (e.g., "101000000011536")
+            data_type: SymbolUpdate or DepthUpdate
             
         Returns:
-            True if data is valid, False otherwise
-        """
-        if not data:
-            return False
-        
-        # Check for required fields
-        required_fields = ["symbol", "exchange"]
-        for field in required_fields:
-            if field not in data or not data[field]:
-                return False
-        
-        # Check for at least one price field
-        price_fields = ["ltp", "open", "high", "low", "close", "bid_price", "ask_price"]
-        has_price = any(field in data and data[field] is not None for field in price_fields)
-        
-        return has_price
-    
-    def format_timestamp(self, timestamp: int) -> str:
-        """
-        Format timestamp to readable string
-        
-        Args:
-            timestamp: Unix timestamp
-            
-        Returns:
-            Formatted timestamp string
+            HSM formatted symbol or None if invalid
         """
         try:
-            if timestamp > 0:
-                return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-            return ""
-        except:
-            return ""
+            return cls._convert_to_hsm_token(brsymbol, database_token, data_type)
+        except Exception as e:
+            import logging
+            logging.error(f"Error creating HSM symbol with database token for {brsymbol}: {e}")
+            return None
+    
+    
+    @classmethod
+    def _convert_to_hsm_token(cls, symbol: str, fytoken: str, data_type: str) -> Optional[str]:
+        """
+        Convert a single symbol and fytoken to HSM token format (from working version)
+        """
+        try:
+            if len(fytoken) < 10:
+                return None
+                
+            ex_sg = fytoken[:4]
+            
+            if ex_sg not in cls.EXCHANGE_SEGMENTS:
+                return None
+                
+            segment = cls.EXCHANGE_SEGMENTS[ex_sg]
+            is_index = symbol.endswith("-INDEX")
+            
+            if is_index:
+                if data_type == "DepthUpdate":
+                    return None  # Index doesn't support depth
+                
+                # Use proper index mapping from working version
+                if symbol in cls.INDEX_MAPPINGS:
+                    token_name = cls.INDEX_MAPPINGS[symbol]
+                else:
+                    token_name = symbol.split(":")[1].replace("-INDEX", "")
+                hsm_token = f"if|{segment}|{token_name}"
+            elif data_type == "DepthUpdate":
+                token_suffix = fytoken[10:]
+                hsm_token = f"dp|{segment}|{token_suffix}"
+            else:
+                token_suffix = fytoken[10:]
+                hsm_token = f"sf|{segment}|{token_suffix}"
+            
+            return hsm_token
+            
+        except Exception:
+            return None
+    
+    @classmethod
+    def create_hsm_symbol(cls, brsymbol: str, brexchange: str, data_type: str) -> Optional[str]:
+        """
+        Legacy method - kept for backward compatibility but should use create_hsm_symbol_with_fytoken
+        """
+        # This method is deprecated - use create_hsm_symbol_with_fytoken instead
+        return None
