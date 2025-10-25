@@ -70,6 +70,13 @@ except ImportError:
     logger.debug("Kotak adapter not available")
 
 try:
+    from broker.shoonya.streaming.shoonya_adapter import ShoonyaWebSocketAdapter
+    register_adapter("Shoonya", ShoonyaWebSocketAdapter)
+    logger.info("Registered shoonya adapter")
+except ImportError:
+    logger.debug("Shoonya adapter not available")
+
+try:
     from broker.upstox.streaming.upstox_adapter import UpstoxWebSocketAdapter
     register_adapter("upstox", UpstoxWebSocketAdapter)
     logger.info("Registered upstox adapter")
