@@ -62,6 +62,27 @@ try:
 except ImportError:
     logger.debug("Fyers adapter not available")
 
+try:
+    from broker.kotak.streaming.kotak_adapter import KotakWebSocketAdapter
+    register_adapter("kotak", KotakWebSocketAdapter)
+    logger.info("Registered kotak adapter")
+except ImportError:
+    logger.debug("Kotak adapter not available")
+
+try:
+    from broker.upstox.streaming.upstox_adapter import UpstoxWebSocketAdapter
+    register_adapter("upstox", UpstoxWebSocketAdapter)
+    logger.info("Registered upstox adapter")
+except ImportError:
+    logger.debug("Upstox adapter not available")
+
+try:
+    from broker.zerodha.streaming.zerodha_adapter import ZerodhaWebSocketAdapter
+    register_adapter("zerodha", ZerodhaWebSocketAdapter)
+    logger.info("Registered zerodha adapter")
+except ImportError:
+    logger.debug("Zerodha adapter not available")
+
 __version__ = "2.1.0"
 __all__ = [
     # Core components
