@@ -42,6 +42,13 @@ logger = logging.getLogger(__name__)
 
 # Register broker adapters
 try:
+    from broker.aliceblue.streaming.aliceblue_adapter import AliceblueWebSocketAdapter
+    register_adapter("aliceblue", AliceblueWebSocketAdapter)
+    logger.info("Registered aliceblue adapter")
+except ImportError:
+    logger.debug("Aliceblue adapter not available")
+
+try:
     from broker.angel.streaming.angel_adapter import AngelWebSocketAdapter
     register_adapter("angel", AngelWebSocketAdapter)
     logger.info("Registered Angel adapter")
