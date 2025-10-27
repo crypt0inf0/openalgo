@@ -5,6 +5,7 @@ Balanced performance without excessive CPU usage for Flask integration
 
 import asyncio
 import json
+import os
 import threading
 import time
 from typing import Dict, Any, Optional
@@ -16,6 +17,7 @@ from websockets.exceptions import ConnectionClosed
 
 from ..production_config import config
 from utils.logging import get_logger
+from .subscription_manager import SubscriptionManager
 
 logger = get_logger(__name__)
 
@@ -223,9 +225,11 @@ class LightweightWebSocketProxy:
         # Lightweight ring buffer
         self.ring_buffer = LightweightRingBuffer(buffer_size)
         
+        # Proper subscription management with reference counting
+        self.subscription_manager = SubscriptionManager()
+        
         # Simple client management
         self.clients = set()
-        self.client_subscriptions = {}  # client_id -> set of topics
         self.client_metrics = {}  # websocket -> basic metrics
         
         # Single event processor (lightweight) - will set main_loop later
@@ -234,6 +238,10 @@ class LightweightWebSocketProxy:
         # Server state
         self.running = False
         self.server = None
+        
+        # Orphaned symbol cleanup
+        self.cleanup_interval = int(os.getenv('WEBSOCKET_CLEANUP_INTERVAL', '300'))  # 5 minutes default
+        self.cleanup_task = None
         
         logger.info(f"Initialized LightweightWebSocketProxy with {buffer_size} buffer")
     
@@ -255,6 +263,9 @@ class LightweightWebSocketProxy:
         
         # Start event processor
         self.event_processor.start()
+        
+        # Start orphaned symbol cleanup task
+        self.cleanup_task = asyncio.create_task(self._orphaned_symbol_cleanup_loop())
         
         # Simple monitoring (no heavy performance tracking)
         
@@ -343,7 +354,14 @@ class LightweightWebSocketProxy:
             self.clients.discard(websocket)
             self.client_metrics.pop(websocket, None)
             client_id = f"client-{id(websocket)}"
-            self.client_subscriptions.pop(client_id, None)
+            
+            # Clean up client subscriptions and handle broker unsubscriptions
+            cleanup_info = self.subscription_manager.cleanup_client(client_id)
+            
+            # Process broker unsubscriptions for symbols with no remaining clients
+            if cleanup_info['broker_unsubscriptions_needed']:
+                await self._cleanup_client_subscriptions(websocket, cleanup_info)
+            
             logger.info(f"Client disconnected: {client_id}")
     
     async def _handle_message(self, websocket, message: str):
@@ -369,6 +387,36 @@ class LightweightWebSocketProxy:
                     'type': 'stats',
                     'data': stats
                 }))
+            elif action == 'get_subscriptions':
+                subscription_details = self.get_subscription_details()
+                await websocket.send(json.dumps({
+                    'type': 'subscription_details',
+                    'data': subscription_details
+                }))
+            elif action == 'cleanup_orphaned':
+                cleanup_result = await self._handle_orphaned_cleanup()
+                await websocket.send(json.dumps({
+                    'type': 'cleanup_result',
+                    'data': cleanup_result
+                }))
+            elif action == 'force_cleanup_symbol':
+                symbol = data.get('symbol')
+                exchange = data.get('exchange', 'NSE')
+                mode = data.get('mode', 1)
+                if symbol:
+                    success = await self._handle_force_cleanup_symbol(symbol, exchange, mode)
+                    await websocket.send(json.dumps({
+                        'type': 'force_cleanup_result',
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'mode': mode,
+                        'success': success
+                    }))
+                else:
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'message': 'Symbol is required for force cleanup'
+                    }))
         
         except json.JSONDecodeError:
             await websocket.send(json.dumps({
@@ -380,7 +428,7 @@ class LightweightWebSocketProxy:
             logger.error(f"Error handling message: {e}")
     
     async def _handle_subscription(self, websocket, data):
-        """Handle client subscriptions"""
+        """Handle client subscriptions with proper reference counting"""
         try:
             symbol = data.get('symbol')
             exchange = data.get('exchange', 'NSE')
@@ -394,32 +442,51 @@ class LightweightWebSocketProxy:
                 }))
                 return
             
-            # Create topic
-            mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(mode, 'LTP')
-            topic = f"{exchange}_{symbol}_{mode_str}"
-            
-            # Subscribe client to topic
             client_id = f"client-{id(websocket)}"
-            if client_id not in self.client_subscriptions:
-                self.client_subscriptions[client_id] = set()
-            self.client_subscriptions[client_id].add(topic)
             
-            # Get user_id for broker subscription
+            # Use subscription manager to handle the subscription
+            success, should_subscribe_to_broker, message = self.subscription_manager.subscribe_client(
+                client_id, symbol, exchange, mode
+            )
+            
+            if not success:
+                await websocket.send(json.dumps({
+                    'type': 'subscribe',
+                    'status': 'error',
+                    'message': message
+                }))
+                return
+            
+            # Get user_id and broker info for broker subscription
             user_id = None
+            broker_name = 'unknown'
             if hasattr(self, 'client_user_mapping'):
                 user_id = self.client_user_mapping.get(id(websocket))
             
-            # Subscribe via broker adapter if available
-            if user_id and hasattr(self, 'broker_adapters') and user_id in self.broker_adapters:
+            # Only subscribe to broker if this is the first client for this symbol
+            broker_subscription_status = 'reused'
+            if should_subscribe_to_broker and user_id and hasattr(self, 'broker_adapters') and user_id in self.broker_adapters:
                 try:
                     adapter = self.broker_adapters[user_id]
                     result = adapter.subscribe(symbol, exchange, mode)
+                    
                     if result and result.get('status') == 'error':
                         logger.warning(f"Broker subscription failed: {result.get('message')}")
+                        broker_subscription_status = 'failed'
                     elif result and result.get('status') == 'success':
                         logger.debug(f"Broker subscription successful: {result.get('message')}")
+                        broker_subscription_status = 'success'
+                        broker_name = result.get('broker', 'unknown')
+                    
                 except Exception as e:
                     logger.error(f"Error in broker subscription: {e}")
+                    broker_subscription_status = 'error'
+            elif should_subscribe_to_broker:
+                logger.warning(f"Should subscribe to broker for {symbol} but no adapter available")
+                broker_subscription_status = 'no_adapter'
+            
+            # Get current subscription count for this symbol
+            subscriber_count = self.subscription_manager.get_symbol_subscribers_count(symbol, exchange, mode)
             
             await websocket.send(json.dumps({
                 'type': 'subscribe',
@@ -429,13 +496,17 @@ class LightweightWebSocketProxy:
                     'exchange': exchange,
                     'status': 'success',
                     'mode': {1: 'LTP', 2: 'Quote', 3: 'Depth'}.get(mode, 'LTP'),
-                    'broker': broker_name if 'broker_name' in locals() else 'unknown'
+                    'broker': broker_name,
+                    'broker_subscription': broker_subscription_status,
+                    'subscriber_count': subscriber_count
                 }],
-                'message': 'Subscription processing complete',
-                'broker': broker_name if 'broker_name' in locals() else 'unknown'
+                'message': message,
+                'broker': broker_name
             }))
             
-            logger.info(f"Subscribed to {topic}")
+            mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(mode, 'LTP')
+            logger.info(f"Client {client_id} subscribed to {exchange}_{symbol}_{mode_str} "
+                       f"(subscribers: {subscriber_count}, broker_action: {broker_subscription_status})")
             
         except Exception as e:
             logger.error(f"Error handling subscription: {e}")
@@ -446,7 +517,7 @@ class LightweightWebSocketProxy:
             }))
     
     async def _handle_unsubscription(self, websocket, data):
-        """Handle client unsubscriptions"""
+        """Handle client unsubscriptions with proper reference counting"""
         try:
             symbol = data.get('symbol')
             exchange = data.get('exchange', 'NSE')
@@ -460,45 +531,71 @@ class LightweightWebSocketProxy:
                 }))
                 return
             
-            # Create topic
-            mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(mode, 'LTP')
-            topic = f"{exchange}_{symbol}_{mode_str}"
-            
-            # Unsubscribe client from topic
             client_id = f"client-{id(websocket)}"
-            if client_id in self.client_subscriptions:
-                self.client_subscriptions[client_id].discard(topic)
             
-            # Get user_id for broker unsubscription
+            # Use subscription manager to handle the unsubscription
+            success, should_unsubscribe_from_broker, message = self.subscription_manager.unsubscribe_client(
+                client_id, symbol, exchange, mode
+            )
+            
+            if not success:
+                await websocket.send(json.dumps({
+                    'type': 'unsubscribe',
+                    'status': 'error',
+                    'message': message
+                }))
+                return
+            
+            # Get user_id and broker info for broker unsubscription
             user_id = None
+            broker_name = 'unknown'
             if hasattr(self, 'client_user_mapping'):
                 user_id = self.client_user_mapping.get(id(websocket))
             
-            # Unsubscribe via broker adapter if available
-            if user_id and hasattr(self, 'broker_adapters') and user_id in self.broker_adapters:
+            # Only unsubscribe from broker if this was the last client for this symbol
+            broker_unsubscription_status = 'kept'
+            if should_unsubscribe_from_broker and user_id and hasattr(self, 'broker_adapters') and user_id in self.broker_adapters:
                 try:
                     adapter = self.broker_adapters[user_id]
                     result = adapter.unsubscribe(symbol, exchange, mode)
+                    
                     if result and not result.get('success', True):
                         logger.warning(f"Broker unsubscription failed: {result.get('error')}")
+                        broker_unsubscription_status = 'failed'
+                    else:
+                        logger.debug(f"Broker unsubscription successful")
+                        broker_unsubscription_status = 'success'
+                        broker_name = result.get('broker', 'unknown') if result else 'unknown'
+                    
                 except Exception as e:
                     logger.error(f"Error in broker unsubscription: {e}")
+                    broker_unsubscription_status = 'error'
+            elif should_unsubscribe_from_broker:
+                logger.warning(f"Should unsubscribe from broker for {symbol} but no adapter available")
+                broker_unsubscription_status = 'no_adapter'
+            
+            # Get remaining subscription count for this symbol
+            remaining_subscribers = self.subscription_manager.get_symbol_subscribers_count(symbol, exchange, mode)
             
             await websocket.send(json.dumps({
                 'type': 'unsubscribe',
                 'status': 'success',
-                'message': 'Unsubscription processing complete',
+                'message': message,
                 'successful': [{
                     'symbol': symbol,
                     'exchange': exchange,
                     'status': 'success',
-                    'broker': 'unknown'
+                    'broker': broker_name,
+                    'broker_unsubscription': broker_unsubscription_status,
+                    'remaining_subscribers': remaining_subscribers
                 }],
                 'failed': [],
-                'broker': 'unknown'
+                'broker': broker_name
             }))
             
-            logger.info(f"Unsubscribed from {topic}")
+            mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(mode, 'LTP')
+            logger.info(f"Client {client_id} unsubscribed from {exchange}_{symbol}_{mode_str} "
+                       f"(remaining: {remaining_subscribers}, broker_action: {broker_unsubscription_status})")
             
         except Exception as e:
             logger.error(f"Error handling unsubscription: {e}")
@@ -668,18 +765,67 @@ class LightweightWebSocketProxy:
         except Exception as e:
             logger.error(f"Error creating broker adapter: {e}")
     
+    async def _cleanup_client_subscriptions(self, websocket, cleanup_info):
+        """Handle broker unsubscriptions when client disconnects"""
+        try:
+            # Get user_id for broker operations
+            user_id = None
+            if hasattr(self, 'client_user_mapping'):
+                user_id = self.client_user_mapping.get(id(websocket))
+            
+            if not user_id or not hasattr(self, 'broker_adapters') or user_id not in self.broker_adapters:
+                logger.debug("No broker adapter available for client cleanup")
+                return
+            
+            adapter = self.broker_adapters[user_id]
+            
+            # Process each broker unsubscription needed
+            for unsub_info in cleanup_info['broker_unsubscriptions_needed']:
+                try:
+                    result = adapter.unsubscribe(
+                        unsub_info['symbol'], 
+                        unsub_info['exchange'], 
+                        unsub_info['mode']
+                    )
+                    
+                    if result and not result.get('success', True):
+                        logger.warning(f"Broker cleanup unsubscription failed for {unsub_info['topic']}: {result.get('error')}")
+                    else:
+                        logger.debug(f"Broker cleanup unsubscription successful for {unsub_info['topic']}")
+                        
+                except Exception as e:
+                    logger.error(f"Error in broker cleanup unsubscription for {unsub_info['topic']}: {e}")
+            
+            logger.info(f"Processed {len(cleanup_info['broker_unsubscriptions_needed'])} broker unsubscriptions during client cleanup")
+            
+        except Exception as e:
+            logger.error(f"Error in _cleanup_client_subscriptions: {e}")
+
     async def _broadcast_to_topic(self, topic: str, message: str):
-        """Broadcast message to all clients subscribed to topic"""
-        for client_id, subscriptions in self.client_subscriptions.items():
-            if topic in subscriptions:
-                # Find websocket by client_id
-                for websocket in self.clients:
-                    if f"client-{id(websocket)}" == client_id:
-                        try:
-                            await websocket.send(message)
-                        except Exception as e:
-                            logger.debug(f"Failed to send to client {client_id}: {e}")
-                        break
+        """Broadcast message to all clients subscribed to topic using subscription manager"""
+        try:
+            # Get all clients subscribed to this topic from subscription manager
+            clients_to_notify = []
+            
+            for websocket in self.clients:
+                client_id = f"client-{id(websocket)}"
+                client_subscriptions = self.subscription_manager.get_client_subscriptions(client_id)
+                if topic in client_subscriptions:
+                    clients_to_notify.append(websocket)
+            
+            # Send message to all subscribed clients
+            for websocket in clients_to_notify:
+                try:
+                    await websocket.send(message)
+                except Exception as e:
+                    client_id = f"client-{id(websocket)}"
+                    logger.debug(f"Failed to send to client {client_id}: {e}")
+            
+            if clients_to_notify:
+                logger.debug(f"Broadcasted message to {len(clients_to_notify)} clients for topic {topic}")
+                
+        except Exception as e:
+            logger.error(f"Error in _broadcast_to_topic: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive system statistics"""
@@ -687,15 +833,152 @@ class LightweightWebSocketProxy:
             'architecture': 'lightweight-disruptor',
             'ring_buffer': self.ring_buffer.get_stats(),
             'event_processor': self.event_processor.get_stats() if self.event_processor else {},
-            'clients': {'count': len(self.clients), 'subscriptions': len(self.client_subscriptions)},
+            'clients': {'count': len(self.clients)},
+            'subscription_manager': self.subscription_manager.get_stats(),
             'running': self.running
         }
+    
+    def get_subscription_details(self) -> Dict[str, Any]:
+        """Get detailed subscription information for debugging"""
+        return self.subscription_manager.get_detailed_status()
+    
+    async def _orphaned_symbol_cleanup_loop(self):
+        """Periodic cleanup of orphaned symbols"""
+        logger.info(f"Started orphaned symbol cleanup loop (interval: {self.cleanup_interval}s)")
+        
+        while self.running:
+            try:
+                await asyncio.sleep(self.cleanup_interval)
+                
+                if not self.running:
+                    break
+                
+                # Perform cleanup
+                cleanup_info = self.subscription_manager.cleanup_orphaned_symbols()
+                
+                # Process broker unsubscriptions for orphaned symbols
+                if cleanup_info['broker_unsubscriptions_needed']:
+                    await self._process_orphaned_broker_unsubscriptions(cleanup_info['broker_unsubscriptions_needed'])
+                
+                if cleanup_info['cleaned_count'] > 0:
+                    logger.info(f"Periodic cleanup: removed {cleanup_info['cleaned_count']} orphaned symbols")
+                
+            except asyncio.CancelledError:
+                logger.info("Orphaned symbol cleanup loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in orphaned symbol cleanup loop: {e}")
+                # Continue running despite errors
+                await asyncio.sleep(60)  # Wait 1 minute before retrying
+    
+    async def _process_orphaned_broker_unsubscriptions(self, unsubscriptions_needed):
+        """Process broker unsubscriptions for orphaned symbols"""
+        try:
+            # Find any available broker adapter to perform unsubscriptions
+            adapter = None
+            if hasattr(self, 'broker_adapters') and self.broker_adapters:
+                adapter = next(iter(self.broker_adapters.values()))
+            
+            if not adapter:
+                logger.warning("No broker adapter available for orphaned symbol cleanup")
+                return
+            
+            successful_cleanups = 0
+            failed_cleanups = 0
+            
+            for unsub_info in unsubscriptions_needed:
+                try:
+                    result = adapter.unsubscribe(
+                        unsub_info['symbol'],
+                        unsub_info['exchange'],
+                        unsub_info['mode']
+                    )
+                    
+                    if result and result.get('success', True):
+                        successful_cleanups += 1
+                        logger.debug(f"Successfully cleaned orphaned broker subscription: {unsub_info['topic']}")
+                    else:
+                        failed_cleanups += 1
+                        logger.warning(f"Failed to clean orphaned broker subscription: {unsub_info['topic']}")
+                    
+                except Exception as e:
+                    failed_cleanups += 1
+                    logger.error(f"Error cleaning orphaned broker subscription {unsub_info['topic']}: {e}")
+            
+            logger.info(f"Orphaned broker cleanup: {successful_cleanups} successful, {failed_cleanups} failed")
+            
+        except Exception as e:
+            logger.error(f"Error in _process_orphaned_broker_unsubscriptions: {e}")
+    
+    async def _handle_orphaned_cleanup(self) -> Dict[str, Any]:
+        """Handle manual orphaned symbol cleanup request"""
+        try:
+            cleanup_info = self.subscription_manager.cleanup_orphaned_symbols()
+            
+            # Process broker unsubscriptions
+            if cleanup_info['broker_unsubscriptions_needed']:
+                await self._process_orphaned_broker_unsubscriptions(cleanup_info['broker_unsubscriptions_needed'])
+            
+            return cleanup_info
+            
+        except Exception as e:
+            logger.error(f"Error in manual orphaned cleanup: {e}")
+            return {'error': str(e), 'cleaned_count': 0}
+    
+    async def _handle_force_cleanup_symbol(self, symbol: str, exchange: str, mode: int) -> bool:
+        """Handle force cleanup of a specific symbol"""
+        try:
+            # Force cleanup in subscription manager
+            was_broker_subscribed = self.subscription_manager.force_cleanup_symbol(symbol, exchange, mode)
+            
+            # If it was broker subscribed, try to unsubscribe from broker
+            if was_broker_subscribed:
+                if hasattr(self, 'broker_adapters') and self.broker_adapters:
+                    adapter = next(iter(self.broker_adapters.values()))
+                    try:
+                        result = adapter.unsubscribe(symbol, exchange, mode)
+                        if result and not result.get('success', True):
+                            logger.warning(f"Force cleanup broker unsubscription failed for {symbol}: {result.get('error')}")
+                    except Exception as e:
+                        logger.error(f"Error in force cleanup broker unsubscription for {symbol}: {e}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in force cleanup symbol {symbol}: {e}")
+            return False
+    
+    def force_cleanup_orphaned_symbols(self):
+        """Force cleanup of orphaned symbols (synchronous method for external calls)"""
+        try:
+            cleanup_info = self.subscription_manager.cleanup_orphaned_symbols()
+            
+            # Schedule broker unsubscriptions if main loop is available
+            if cleanup_info['broker_unsubscriptions_needed'] and hasattr(self, '_main_loop') and not self._main_loop.is_closed():
+                asyncio.run_coroutine_threadsafe(
+                    self._process_orphaned_broker_unsubscriptions(cleanup_info['broker_unsubscriptions_needed']),
+                    self._main_loop
+                )
+            
+            return cleanup_info
+            
+        except Exception as e:
+            logger.error(f"Error in force cleanup orphaned symbols: {e}")
+            return {'error': str(e), 'cleaned_count': 0}
     
     async def shutdown(self):
         """Shutdown the lightweight proxy"""
         logger.info("Shutting down Lightweight WebSocket Proxy")
         
         self.running = False
+        
+        # Stop cleanup task
+        if self.cleanup_task and not self.cleanup_task.done():
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
         
         # Stop event processor
         if self.event_processor:
