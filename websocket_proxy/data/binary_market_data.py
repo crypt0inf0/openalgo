@@ -3,6 +3,7 @@ Enhanced Binary Market Data for ultra-fast serialization with OHLC support.
 Optimized for nanosecond-level performance with fixed-size binary layout.
 """
 
+import os
 import struct
 import time
 import xxhash
@@ -10,13 +11,15 @@ from dataclasses import dataclass
 from typing import ClassVar, Optional, Union
 from .market_data import MarketDataMessage
 
-# Cache for symbol hash computations
+# Cache for symbol hash computations with size limit
 _symbol_hash_cache = {}
+_symbol_hash_access_times = {}
+_MAX_CACHE_SIZE = int(os.getenv('SYMBOL_HASH_CACHE_SIZE', '50000'))  # 50K symbols max
 
 
 def get_symbol_hash(symbol: str, exchange: str) -> int:
     """
-    Get cached hash for symbol-exchange pair.
+    Get cached hash for symbol-exchange pair with LRU eviction.
     
     Args:
         symbol: Trading symbol
@@ -25,10 +28,38 @@ def get_symbol_hash(symbol: str, exchange: str) -> int:
     Returns:
         int: 64-bit hash value
     """
+    import time
+    
     key = f"{exchange}:{symbol}"
+    current_time = time.time()
+    
     if key not in _symbol_hash_cache:
+        # Check if we need to evict before adding
+        if len(_symbol_hash_cache) >= _MAX_CACHE_SIZE:
+            _evict_symbol_hash_cache()
+        
         _symbol_hash_cache[key] = xxhash.xxh64(key).intdigest()
+    
+    # Update access time for LRU
+    _symbol_hash_access_times[key] = current_time
     return _symbol_hash_cache[key]
+
+
+def _evict_symbol_hash_cache():
+    """Evict least recently used items from symbol hash cache"""
+    if not _symbol_hash_access_times:
+        return
+    
+    # Remove 10% of cache (oldest items)
+    evict_count = max(100, len(_symbol_hash_cache) // 10)
+    
+    # Sort by access time and remove oldest
+    sorted_items = sorted(_symbol_hash_access_times.items(), key=lambda x: x[1])
+    items_to_remove = sorted_items[:evict_count]
+    
+    for key, _ in items_to_remove:
+        _symbol_hash_cache.pop(key, None)
+        _symbol_hash_access_times.pop(key, None)
 
 
 def get_exchange_from_hash(symbol_hash: int) -> Optional[str]:
@@ -50,8 +81,18 @@ def get_exchange_from_hash(symbol_hash: int) -> Optional[str]:
 
 def clear_symbol_hash_cache():
     """Clear the symbol hash cache."""
-    global _symbol_hash_cache
+    global _symbol_hash_cache, _symbol_hash_access_times
     _symbol_hash_cache.clear()
+    _symbol_hash_access_times.clear()
+
+
+def get_symbol_hash_cache_stats() -> dict:
+    """Get symbol hash cache statistics"""
+    return {
+        'size': len(_symbol_hash_cache),
+        'max_size': _MAX_CACHE_SIZE,
+        'utilization': (len(_symbol_hash_cache) / _MAX_CACHE_SIZE * 100) if _MAX_CACHE_SIZE > 0 else 0
+    }
 
 
 @dataclass

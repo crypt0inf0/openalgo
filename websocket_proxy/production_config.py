@@ -32,6 +32,11 @@ class ProductionConfig:
     MAX_MEMORY_MB = int(os.getenv('MAX_MEMORY_MB', '2048'))  # 2GB limit
     GC_THRESHOLD = int(os.getenv('GC_THRESHOLD_MB', '1024'))  # Trigger cleanup at 1GB
     
+    # Cache Settings
+    ANGEL_CACHE_SIZE = int(os.getenv('ANGEL_CACHE_SIZE', '10000'))  # Angel market data cache
+    SYMBOL_HASH_CACHE_SIZE = int(os.getenv('SYMBOL_HASH_CACHE_SIZE', '50000'))  # Symbol hash cache
+    MEMORY_CHECK_INTERVAL = int(os.getenv('MEMORY_CHECK_INTERVAL', '60'))  # Memory check interval in seconds
+    
     # Logging
     LOG_LEVEL = os.getenv('WEBSOCKET_LOG_LEVEL', 'INFO')
     ENABLE_PERFORMANCE_LOGGING = os.getenv('ENABLE_PERFORMANCE_LOGGING', 'true').lower() == 'true'

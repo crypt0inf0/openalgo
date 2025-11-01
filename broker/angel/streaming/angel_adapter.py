@@ -39,17 +39,37 @@ class Config:
 
 
 class MarketDataCache:
-    """Thread-safe cache for market data to handle partial updates"""
+    """Thread-safe cache for market data to handle partial updates with memory limits"""
     
-    def __init__(self):
+    def __init__(self, max_size: int = 10000):
         self._cache = {}
+        self._access_times = {}  # For LRU eviction
         self._lock = threading.Lock()
+        self.max_size = max_size
+        self.eviction_batch_size = max(100, max_size // 100)  # Evict 1% or min 100 items
         self.logger = logging.getLogger("angel_market_cache")
+        
+        # Statistics
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
 
     def update(self, token: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Update cache with new data and return merged result"""
         with self._lock:
+            import time
+            current_time = time.time()
+            
+            # Check if we need to evict before adding
+            if len(self._cache) >= self.max_size and token not in self._cache:
+                self._evict_lru_items()
+            
             cached_data = self._cache.get(token, {})
+            if cached_data:
+                self.hits += 1
+            else:
+                self.misses += 1
+            
             merged = cached_data.copy()
             
             # Update with non-empty values
@@ -61,17 +81,54 @@ class MarketDataCache:
                     merged[k] = v
                     
             self._cache[token] = merged
+            self._access_times[token] = current_time
+            
             return merged.copy()
+
+    def _evict_lru_items(self):
+        """Evict least recently used items to free memory"""
+        if not self._access_times:
+            return
+            
+        # Sort by access time and remove oldest items
+        sorted_items = sorted(self._access_times.items(), key=lambda x: x[1])
+        items_to_remove = sorted_items[:self.eviction_batch_size]
+        
+        for token, _ in items_to_remove:
+            self._cache.pop(token, None)
+            self._access_times.pop(token, None)
+            self.evictions += 1
+        
+        self.logger.info(f"Evicted {len(items_to_remove)} items from cache. "
+                        f"Cache size: {len(self._cache)}/{self.max_size}")
 
     def clear_token(self, token: str):
         """Clear cache for a specific token"""
         with self._lock:
             self._cache.pop(token, None)
+            self._access_times.pop(token, None)
 
     def clear_all(self):
         """Clear entire cache"""
         with self._lock:
             self._cache.clear()
+            self._access_times.clear()
+            
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        with self._lock:
+            total_requests = self.hits + self.misses
+            hit_rate = (self.hits / total_requests * 100) if total_requests > 0 else 0
+            
+            return {
+                'size': len(self._cache),
+                'max_size': self.max_size,
+                'utilization': (len(self._cache) / self.max_size * 100) if self.max_size > 0 else 0,
+                'hits': self.hits,
+                'misses': self.misses,
+                'hit_rate': hit_rate,
+                'evictions': self.evictions
+            }
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -120,8 +177,9 @@ class AngelWebSocketAdapter:
         self.api_key: Optional[str] = None
         self.client_code: Optional[str] = None
         
-        # Data management
-        self.market_cache = MarketDataCache()
+        # Data management with memory limits
+        cache_size = int(os.getenv('ANGEL_CACHE_SIZE', '10000'))
+        self.market_cache = MarketDataCache(max_size=cache_size)
         self.subscriptions: Dict[str, Dict[str, Any]] = {}
         self.token_to_symbol: Dict[str, tuple] = {}
         
@@ -133,6 +191,11 @@ class AngelWebSocketAdapter:
         self.max_reconnect_attempts = 10
         self.reconnect_delay = 5
         self.max_reconnect_delay = 60
+        
+        # Memory monitoring
+        self.max_memory_mb = int(os.getenv('MAX_MEMORY_MB', '2048'))
+        self.last_memory_check = time.time()
+        self.memory_check_interval = 60  # Check every minute
         
         # Zero-backpressure proxy
         self.zbp_proxy = None
@@ -556,6 +619,9 @@ class AngelWebSocketAdapter:
             mode = subscription['mode']
             token = subscription['token']
             
+            # Periodic memory check
+            self._check_memory_usage()
+            
             # Update cache with new data
             cached_data = self.market_cache.update(token, data)
             
@@ -695,6 +761,63 @@ class AngelWebSocketAdapter:
                 depth.append({'price': 0.0, 'quantity': 0, 'orders': 0})
         
         return depth
+
+    def _check_memory_usage(self) -> None:
+        """Check memory usage and perform cleanup if needed"""
+        try:
+            current_time = time.time()
+            if current_time - self.last_memory_check < self.memory_check_interval:
+                return
+                
+            self.last_memory_check = current_time
+            
+            # Try to get memory usage
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_mb = process.memory_info().rss / 1024 / 1024
+                
+                if memory_mb > self.max_memory_mb:
+                    self.logger.warning(f"Memory usage {memory_mb:.1f}MB exceeds limit {self.max_memory_mb}MB. "
+                                      f"Performing cleanup...")
+                    self._force_memory_cleanup()
+                elif memory_mb > self.max_memory_mb * 0.8:  # 80% threshold warning
+                    self.logger.info(f"Memory usage {memory_mb:.1f}MB approaching limit {self.max_memory_mb}MB")
+                    
+            except ImportError:
+                # psutil not available, use basic cleanup based on cache size
+                cache_stats = self.market_cache.get_stats()
+                if cache_stats['utilization'] > 90:  # 90% cache utilization
+                    self.logger.warning("Cache utilization high, performing cleanup...")
+                    self._force_memory_cleanup()
+                    
+        except Exception as e:
+            self.logger.error(f"Error checking memory usage: {e}")
+
+    def _force_memory_cleanup(self) -> None:
+        """Force memory cleanup when limits are exceeded"""
+        try:
+            # Clear half the cache
+            with self.lock:
+                cache_size = len(self.market_cache._cache)
+                if cache_size > 100:
+                    # Reduce cache size by 50%
+                    self.market_cache.max_size = max(1000, cache_size // 2)
+                    self.market_cache._evict_lru_items()
+                    
+            # Clear unused subscriptions (those not in active subscriptions)
+            active_tokens = set(sub.get('token') for sub in self.subscriptions.values())
+            with self.lock:
+                cached_tokens = set(self.market_cache._cache.keys())
+                unused_tokens = cached_tokens - active_tokens
+                
+                for token in list(unused_tokens)[:1000]:  # Limit cleanup batch
+                    self.market_cache.clear_token(token)
+                    
+            self.logger.info(f"Memory cleanup completed. Removed {len(unused_tokens)} unused cache entries")
+            
+        except Exception as e:
+            self.logger.error(f"Error during memory cleanup: {e}")
 
     def cleanup(self) -> None:
         """Clean up adapter resources"""

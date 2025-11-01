@@ -232,6 +232,11 @@ class LightweightWebSocketProxy:
         self.clients = set()
         self.client_metrics = {}  # websocket -> basic metrics
         
+        # Broker adapter management with cleanup
+        self.broker_adapters = {}  # user_id -> adapter
+        self.client_user_mapping = {}  # websocket_id -> user_id
+        self.user_last_activity = {}  # user_id -> timestamp
+        
         # Single event processor (lightweight) - will set main_loop later
         self.event_processor = None
         
@@ -242,6 +247,13 @@ class LightweightWebSocketProxy:
         # Orphaned symbol cleanup
         self.cleanup_interval = int(os.getenv('WEBSOCKET_CLEANUP_INTERVAL', '300'))  # 5 minutes default
         self.cleanup_task = None
+        
+        # Memory monitoring
+        self.memory_monitor = None
+        
+        # Broker adapter cleanup settings
+        self.broker_adapter_cleanup_delay = int(os.getenv('BROKER_ADAPTER_CLEANUP_DELAY', '60'))  # 1 minute
+        self.broker_adapter_max_idle = int(os.getenv('BROKER_ADAPTER_MAX_IDLE', '1800'))  # 30 minutes
         
         logger.info(f"Initialized LightweightWebSocketProxy with {buffer_size} buffer")
     
@@ -266,6 +278,25 @@ class LightweightWebSocketProxy:
         
         # Start orphaned symbol cleanup task
         self.cleanup_task = asyncio.create_task(self._orphaned_symbol_cleanup_loop())
+        
+        # Start memory monitoring
+        try:
+            from ..utils.memory_monitor import get_memory_monitor
+            self.memory_monitor = get_memory_monitor()
+            
+            # Register cleanup callbacks
+            self.memory_monitor.add_cleanup_callback(
+                self._memory_cleanup_callback, 
+                "WebSocketProxy"
+            )
+            
+            self.memory_monitor.start_monitoring()
+            logger.info("Memory monitoring started")
+        except Exception as e:
+            logger.warning(f"Failed to start memory monitoring: {e}")
+        
+        # Start memory monitoring task
+        self.memory_monitor_task = asyncio.create_task(self._memory_monitor_loop())
         
         # Simple monitoring (no heavy performance tracking)
         
@@ -354,6 +385,7 @@ class LightweightWebSocketProxy:
             self.clients.discard(websocket)
             self.client_metrics.pop(websocket, None)
             client_id = f"client-{id(websocket)}"
+            websocket_id = id(websocket)
             
             # Clean up client subscriptions and handle broker unsubscriptions
             cleanup_info = self.subscription_manager.cleanup_client(client_id)
@@ -361,6 +393,21 @@ class LightweightWebSocketProxy:
             # Process broker unsubscriptions for symbols with no remaining clients
             if cleanup_info['broker_unsubscriptions_needed']:
                 await self._cleanup_client_subscriptions(websocket, cleanup_info)
+            
+            # Clean up user mapping and check if we can cleanup broker adapter
+            user_id = self.client_user_mapping.pop(websocket_id, None)
+            if user_id:
+                # Update last activity for this user
+                self.user_last_activity[user_id] = time.time()
+                
+                # Check if this user has any other active connections
+                user_has_other_connections = any(
+                    uid == user_id for uid in self.client_user_mapping.values()
+                )
+                
+                if not user_has_other_connections:
+                    # Schedule broker adapter cleanup after a delay (in case of reconnection)
+                    asyncio.create_task(self._schedule_broker_adapter_cleanup(user_id))
             
             logger.info(f"Client disconnected: {client_id}")
     
@@ -417,6 +464,12 @@ class LightweightWebSocketProxy:
                         'type': 'error',
                         'message': 'Symbol is required for force cleanup'
                     }))
+            elif action == 'force_memory_cleanup':
+                cleanup_results = self.force_memory_cleanup()
+                await websocket.send(json.dumps({
+                    'type': 'memory_cleanup_result',
+                    'data': cleanup_results
+                }))
         
         except json.JSONDecodeError:
             await websocket.send(json.dumps({
@@ -708,11 +761,8 @@ class LightweightWebSocketProxy:
                 logger.info(f"Broker adapter already exists for user {user_id}")
                 return
             
-            # Initialize broker adapters dict if not exists
-            if not hasattr(self, 'broker_adapters'):
-                self.broker_adapters = {}
-            if not hasattr(self, 'client_user_mapping'):
-                self.client_user_mapping = {}
+            # Update user activity
+            self.user_last_activity[user_id] = time.time()
             
             # Create adapter
             logger.info(f"Creating {broker_name} adapter for user {user_id}")
@@ -829,7 +879,7 @@ class LightweightWebSocketProxy:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive system statistics"""
-        return {
+        stats = {
             'architecture': 'lightweight-disruptor',
             'ring_buffer': self.ring_buffer.get_stats(),
             'event_processor': self.event_processor.get_stats() if self.event_processor else {},
@@ -837,6 +887,52 @@ class LightweightWebSocketProxy:
             'subscription_manager': self.subscription_manager.get_stats(),
             'running': self.running
         }
+        
+        # Add memory statistics from memory monitor
+        if self.memory_monitor:
+            try:
+                stats['memory'] = self.memory_monitor.get_stats()
+            except Exception as e:
+                stats['memory'] = {'error': str(e)}
+        else:
+            # Fallback to basic memory info
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_info = process.memory_info()
+                stats['memory'] = {
+                    'rss_mb': memory_info.rss / 1024 / 1024,
+                    'vms_mb': memory_info.vms / 1024 / 1024,
+                    'percent': process.memory_percent()
+                }
+            except ImportError:
+                stats['memory'] = {'status': 'psutil not available'}
+            except Exception as e:
+                stats['memory'] = {'error': str(e)}
+        
+        # Add broker adapter info
+        stats['broker_adapters'] = {
+            'count': len(self.broker_adapters),
+            'users': list(self.broker_adapters.keys())
+        }
+        
+        # Add symbol hash cache stats
+        try:
+            from ..data.binary_market_data import get_symbol_hash_cache_stats
+            stats['symbol_hash_cache'] = get_symbol_hash_cache_stats()
+        except Exception as e:
+            stats['symbol_hash_cache'] = {'error': str(e)}
+        
+        # Add broker adapter cache stats if available
+        if hasattr(self, 'broker_adapters'):
+            broker_stats = {}
+            for user_id, adapter in self.broker_adapters.items():
+                if hasattr(adapter, 'market_cache') and hasattr(adapter.market_cache, 'get_stats'):
+                    broker_stats[user_id] = adapter.market_cache.get_stats()
+            if broker_stats:
+                stats['broker_caches'] = broker_stats
+        
+        return stats
     
     def get_subscription_details(self) -> Dict[str, Any]:
         """Get detailed subscription information for debugging"""
@@ -868,6 +964,55 @@ class LightweightWebSocketProxy:
                 break
             except Exception as e:
                 logger.error(f"Error in orphaned symbol cleanup loop: {e}")
+                # Continue running despite errors
+                await asyncio.sleep(60)  # Wait 1 minute before retrying
+    
+    async def _memory_monitor_loop(self):
+        """Periodic memory monitoring and cleanup"""
+        memory_check_interval = int(os.getenv('MEMORY_CHECK_INTERVAL', '300'))  # 5 minutes default
+        max_memory_mb = int(os.getenv('MAX_MEMORY_MB', '2048'))
+        
+        logger.info(f"Started memory monitor loop (interval: {memory_check_interval}s, limit: {max_memory_mb}MB)")
+        
+        while self.running:
+            try:
+                await asyncio.sleep(memory_check_interval)
+                
+                if not self.running:
+                    break
+                
+                # Check memory usage
+                try:
+                    import psutil
+                    process = psutil.Process()
+                    memory_mb = process.memory_info().rss / 1024 / 1024
+                    
+                    if memory_mb > max_memory_mb:
+                        logger.warning(f"Memory usage {memory_mb:.1f}MB exceeds limit {max_memory_mb}MB. "
+                                     f"Performing automatic cleanup...")
+                        cleanup_results = self.force_memory_cleanup()
+                        logger.info(f"Automatic memory cleanup completed: {len(cleanup_results.get('actions_taken', []))} actions")
+                        
+                    elif memory_mb > max_memory_mb * 0.8:  # 80% threshold
+                        logger.info(f"Memory usage {memory_mb:.1f}MB approaching limit {max_memory_mb}MB")
+                        
+                        # Log detailed stats at warning level
+                        stats = self.get_stats()
+                        logger.info(f"Memory stats: Ring buffer: {stats['ring_buffer']['utilization']:.1f}%, "
+                                  f"Clients: {stats['clients']['count']}, "
+                                  f"Active subscriptions: {stats['subscription_manager'].get('active_topics', 0)}")
+                        
+                except ImportError:
+                    # psutil not available, skip memory monitoring
+                    logger.debug("psutil not available for memory monitoring")
+                except Exception as e:
+                    logger.error(f"Error checking memory usage: {e}")
+                
+            except asyncio.CancelledError:
+                logger.info("Memory monitor loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in memory monitor loop: {e}")
                 # Continue running despite errors
                 await asyncio.sleep(60)  # Wait 1 minute before retrying
     
@@ -966,6 +1111,45 @@ class LightweightWebSocketProxy:
             logger.error(f"Error in force cleanup orphaned symbols: {e}")
             return {'error': str(e), 'cleaned_count': 0}
     
+    def force_memory_cleanup(self):
+        """Force memory cleanup across all components"""
+        try:
+            cleanup_results = {
+                'timestamp': time.time(),
+                'actions_taken': []
+            }
+            
+            # Clean up symbol hash cache
+            try:
+                from ..data.binary_market_data import clear_symbol_hash_cache, get_symbol_hash_cache_stats
+                cache_stats_before = get_symbol_hash_cache_stats()
+                clear_symbol_hash_cache()
+                cleanup_results['actions_taken'].append(f"Cleared symbol hash cache ({cache_stats_before['size']} entries)")
+            except Exception as e:
+                logger.error(f"Error clearing symbol hash cache: {e}")
+            
+            # Clean up broker adapter caches
+            if hasattr(self, 'broker_adapters'):
+                for user_id, adapter in self.broker_adapters.items():
+                    try:
+                        if hasattr(adapter, '_force_memory_cleanup'):
+                            adapter._force_memory_cleanup()
+                            cleanup_results['actions_taken'].append(f"Cleaned broker cache for user {user_id}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning broker cache for {user_id}: {e}")
+            
+            # Clean up orphaned symbols
+            orphaned_cleanup = self.force_cleanup_orphaned_symbols()
+            if orphaned_cleanup.get('cleaned_count', 0) > 0:
+                cleanup_results['actions_taken'].append(f"Cleaned {orphaned_cleanup['cleaned_count']} orphaned symbols")
+            
+            logger.info(f"Memory cleanup completed: {cleanup_results}")
+            return cleanup_results
+            
+        except Exception as e:
+            logger.error(f"Error in force memory cleanup: {e}")
+            return {'error': str(e), 'actions_taken': []}
+    
     async def shutdown(self):
         """Shutdown the lightweight proxy"""
         logger.info("Shutting down Lightweight WebSocket Proxy")
@@ -980,9 +1164,35 @@ class LightweightWebSocketProxy:
             except asyncio.CancelledError:
                 pass
         
+        # Stop memory monitor task
+        if hasattr(self, 'memory_monitor_task') and self.memory_monitor_task and not self.memory_monitor_task.done():
+            self.memory_monitor_task.cancel()
+            try:
+                await self.memory_monitor_task
+            except asyncio.CancelledError:
+                pass
+        
         # Stop event processor
         if self.event_processor:
             self.event_processor.stop()
+        
+        # Stop memory monitoring
+        if self.memory_monitor:
+            try:
+                self.memory_monitor.stop_monitoring()
+            except Exception as e:
+                logger.error(f"Error stopping memory monitor: {e}")
+        
+        # Clean up broker adapters
+        for user_id, adapter in list(self.broker_adapters.items()):
+            try:
+                if hasattr(adapter, 'cleanup'):
+                    adapter.cleanup()
+                elif hasattr(adapter, 'disconnect'):
+                    adapter.disconnect()
+            except Exception as e:
+                logger.error(f"Error cleaning up adapter for {user_id}: {e}")
+        self.broker_adapters.clear()
         
         # Stop client monitoring
         pass  # Simplified client management
@@ -1024,3 +1234,104 @@ class LightweightWebSocketProxy:
                 logger.warning(f"Error closing WebSocket server: {e}")
         
         logger.info("Lightweight WebSocket Proxy shutdown complete (sync)")
+    
+    async def _schedule_broker_adapter_cleanup(self, user_id: str):
+        """Schedule cleanup of broker adapter after delay"""
+        try:
+            # Wait for the cleanup delay
+            await asyncio.sleep(self.broker_adapter_cleanup_delay)
+            
+            # Check if user has reconnected
+            user_has_connections = any(
+                uid == user_id for uid in self.client_user_mapping.values()
+            )
+            
+            if not user_has_connections:
+                # Clean up the broker adapter
+                adapter = self.broker_adapters.pop(user_id, None)
+                if adapter:
+                    try:
+                        if hasattr(adapter, 'cleanup'):
+                            adapter.cleanup()
+                        elif hasattr(adapter, 'disconnect'):
+                            adapter.disconnect()
+                        logger.info(f"Cleaned up broker adapter for user {user_id}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning up broker adapter for user {user_id}: {e}")
+                
+                # Clean up user activity tracking
+                self.user_last_activity.pop(user_id, None)
+                
+        except Exception as e:
+            logger.error(f"Error in broker adapter cleanup for user {user_id}: {e}")
+    
+    def _memory_cleanup_callback(self) -> str:
+        """Memory cleanup callback for memory monitor"""
+        try:
+            cleanup_results = []
+            current_time = time.time()
+            
+            # 1. Clean up idle broker adapters
+            idle_users = []
+            for user_id, last_activity in self.user_last_activity.items():
+                if current_time - last_activity > self.broker_adapter_max_idle:
+                    idle_users.append(user_id)
+            
+            for user_id in idle_users:
+                adapter = self.broker_adapters.pop(user_id, None)
+                if adapter:
+                    try:
+                        if hasattr(adapter, 'cleanup'):
+                            adapter.cleanup()
+                        elif hasattr(adapter, 'disconnect'):
+                            adapter.disconnect()
+                    except Exception as e:
+                        logger.error(f"Error cleaning up idle adapter for {user_id}: {e}")
+                
+                self.user_last_activity.pop(user_id, None)
+            
+            if idle_users:
+                cleanup_results.append(f"Cleaned {len(idle_users)} idle broker adapters")
+            
+            # 2. Clean up orphaned symbols
+            orphaned_cleanup = self.subscription_manager.cleanup_orphaned_symbols()
+            if orphaned_cleanup['cleaned_count'] > 0:
+                cleanup_results.append(f"Cleaned {orphaned_cleanup['cleaned_count']} orphaned symbols")
+            
+            # 3. Clean up symbol hash cache
+            try:
+                from ..data.binary_market_data import clear_symbol_hash_cache, get_symbol_hash_cache_stats
+                cache_stats_before = get_symbol_hash_cache_stats()
+                if cache_stats_before['size'] > 1000:  # Only clear if cache is large
+                    clear_symbol_hash_cache()
+                    cleanup_results.append(f"Cleared symbol hash cache ({cache_stats_before['size']} entries)")
+            except Exception as e:
+                logger.error(f"Error cleaning symbol hash cache: {e}")
+            
+            # 4. Clean up ring buffer statistics (reset counters)
+            try:
+                self.ring_buffer.dropped_count = 0
+                self.ring_buffer.published_count = min(self.ring_buffer.published_count, 1000000)
+                self.ring_buffer.consumed_count = min(self.ring_buffer.consumed_count, 1000000)
+                cleanup_results.append("Reset ring buffer counters")
+            except Exception as e:
+                logger.error(f"Error resetting ring buffer counters: {e}")
+            
+            # 5. Clean up client metrics history
+            try:
+                # Keep only recent client metrics
+                clients_to_keep = set(self.clients)
+                old_metrics = set(self.client_metrics.keys()) - clients_to_keep
+                for websocket in old_metrics:
+                    self.client_metrics.pop(websocket, None)
+                
+                if old_metrics:
+                    cleanup_results.append(f"Cleaned {len(old_metrics)} old client metrics")
+            except Exception as e:
+                logger.error(f"Error cleaning client metrics: {e}")
+            
+            return "; ".join(cleanup_results) if cleanup_results else "No cleanup needed"
+            
+        except Exception as e:
+            logger.error(f"Error in memory cleanup callback: {e}")
+            return f"Cleanup error: {e}"
