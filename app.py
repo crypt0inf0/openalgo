@@ -542,19 +542,17 @@ with app.app_context():
 
 # Integrate the WebSocket proxy server with the Flask app
 # Check if running in Docker (standalone mode) or local (integrated mode)
-# Docker is detected by checking for /.dockerenv file or APP_MODE override
-is_docker = os.path.exists('/.dockerenv') or os.environ.get('APP_MODE', '').strip().strip("'\"") == 'standalone'
+# Standalone mode is determined by APP_MODE='standalone' env var
+is_standalone = os.environ.get('APP_MODE', '').strip().strip("'\"") == 'standalone'
 
-if is_docker:
-    logger.debug("Running in Docker/standalone mode - WebSocket server started separately by start.sh")
+if is_standalone:
+    logger.debug("Running in standalone mode - WebSocket server started separately")
 else:
-    logger.debug("Running in local/integrated mode - Starting WebSocket proxy in Flask")
+    logger.debug("Running in integrated mode - Starting WebSocket proxy in Flask")
     start_websocket_proxy(app)
 
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == '__main__':
-    # Get environment variables
-    host_ip = os.getenv('FLASK_HOST_IP', '127.0.0.1')  # Default to '127.0.0.1' if not set
     port = int(os.getenv('FLASK_PORT', 5000))  # Default to 5000 if not set
     ws_port = int(os.getenv('WEBSOCKET_PORT', 8765))  # WebSocket port
     debug = os.getenv('FLASK_DEBUG', 'False').lower() in ('true', '1', 't')  # Default to False if not set
@@ -588,6 +586,7 @@ if __name__ == '__main__':
     import socket
 
     # Determine display IP for banner
+    host_ip = '0.0.0.0'
     display_ip = host_ip
     if host_ip == '0.0.0.0':
         # Get local network IP for display

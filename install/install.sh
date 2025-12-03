@@ -689,6 +689,13 @@ sudo sed -i "s|WEBSOCKET_URL='.*'|WEBSOCKET_URL='wss://$DOMAIN/ws'|g" $OPENALGO_
 sudo sed -i "s|WEBSOCKET_HOST='127.0.0.1'|WEBSOCKET_HOST='0.0.0.0'|g" $OPENALGO_PATH/.env
 sudo sed -i "s|ZMQ_HOST='127.0.0.1'|ZMQ_HOST='0.0.0.0'|g" $OPENALGO_PATH/.env
 
+# Set APP_MODE to standalone for VPS installation
+if grep -q "APP_MODE=" $OPENALGO_PATH/.env; then
+    sudo sed -i "s|APP_MODE=.*|APP_MODE='standalone'|g" $OPENALGO_PATH/.env
+else
+    echo "APP_MODE='standalone'" | sudo tee -a $OPENALGO_PATH/.env > /dev/null
+fi
+
 check_status "Failed to configure environment file"
 
 # Check and handle existing Nginx configuration
@@ -946,6 +953,29 @@ log_message "\nTesting Nginx configuration..." "$BLUE"
 sudo nginx -t
 check_status "Failed to validate Nginx configuration"
 
+# Create standalone startup script
+log_message "\nCreating standalone startup script..." "$BLUE"
+sudo tee $OPENALGO_PATH/start-standalone.sh > /dev/null << EOL
+#!/bin/bash
+source $VENV_PATH/bin/activate
+
+# Start WebSocket proxy server in background
+echo "[OpenAlgo] Starting WebSocket proxy server..."
+$VENV_PATH/bin/python -m websocket_proxy.server &
+
+# Start Gunicorn
+echo "[OpenAlgo] Starting application..."
+exec $VENV_PATH/bin/gunicorn \\
+    --worker-class eventlet \\
+    -w 1 \\
+    --bind unix:$SOCKET_FILE \\
+    --log-level info \\
+    app:app
+EOL
+sudo chmod +x $OPENALGO_PATH/start-standalone.sh
+sudo chown $WEB_USER:$WEB_GROUP $OPENALGO_PATH/start-standalone.sh
+check_status "Failed to create startup script"
+
 # Check and handle existing systemd service
 handle_existing "/etc/systemd/system/$SERVICE_NAME.service" "systemd service" "OpenAlgo service file"
 
@@ -960,13 +990,8 @@ After=network.target
 User=$WEB_USER
 Group=$WEB_GROUP
 WorkingDirectory=$OPENALGO_PATH
-# Simplified approach to ensure Python environment is properly loaded
-ExecStart=/bin/bash -c 'source $VENV_PATH/bin/activate && $VENV_PATH/bin/gunicorn \
-    --worker-class eventlet \
-    -w 1 \
-    --bind unix:$SOCKET_FILE \
-    --log-level info \
-    app:app'
+# Use the custom standalone startup script
+ExecStart=$OPENALGO_PATH/start-standalone.sh
 # Restart settings
 Restart=always
 RestartSec=5
