@@ -307,6 +307,8 @@ class WebSocketProxy:
                         # Clean up empty entries
                         if not self.subscription_index[sub_key]:
                             del self.subscription_index[sub_key]
+                            # Also clean up last_message_time to prevent memory leak
+                            self.last_message_time.pop(sub_key, None)
 
                     # Get the user's broker adapter
                     user_id = self.user_mapping.get(client_id)
@@ -871,6 +873,9 @@ class WebSocketProxy:
                 await websocket.send(json.dumps(message))
             except websockets.exceptions.ConnectionClosed:
                 logger.info(f"Connection closed while sending message to client {client_id}")
+            except Exception as e:
+                # Handle any unexpected socket errors gracefully
+                logger.warning(f"Error sending message to client {client_id}: {e}")
     
     async def send_error(self, client_id, code, message):
         """

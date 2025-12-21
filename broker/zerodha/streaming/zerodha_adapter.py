@@ -91,11 +91,26 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if not self.access_token:
                 return {'status': 'error', 'message': 'Invalid access token'}
             
-            # Initialize WebSocket client
+            # Define token refresh callback for handling token expiry
+            def get_fresh_token() -> Optional[str]:
+                """Callback to get fresh access token from database"""
+                try:
+                    fresh_auth_token = get_auth_token(self.user_id)
+                    if fresh_auth_token:
+                        if ':' in fresh_auth_token:
+                            parts = fresh_auth_token.split(':')
+                            return parts[1] if len(parts) >= 2 else fresh_auth_token
+                        return fresh_auth_token
+                except Exception as e:
+                    self.logger.error(f"Error refreshing token: {e}")
+                return None
+            
+            # Initialize WebSocket client with token refresh callback
             self.ws_client = ZerodhaWebSocket(
                 api_key=self.api_key,
                 access_token=self.access_token,
-                on_ticks=self._handle_ticks
+                on_ticks=self._handle_ticks,
+                token_refresh_callback=get_fresh_token  # Enables automatic token refresh on reconnect
             )
             
             # Set up WebSocket callbacks
