@@ -220,8 +220,12 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 'is_fallback': is_fallback
             }
 
-        # Subscribe if connected
-        if self.connected and self.ws_client:
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 # Register scrip with Motilal WebSocket
                 success = self.ws_client.register_scrip(
@@ -232,12 +236,14 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 )
 
                 if not success:
+                    self._decrement_ref(scrip, sub_type)  # Rollback on error
                     return self._create_error_response("SUBSCRIPTION_ERROR",
                                                       f"Failed to register scrip {symbol}")
 
                 self.logger.debug(f"Subscribed to {symbol}.{exchange} (token: {token}, mode: {mode})")
 
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
 
@@ -288,8 +294,12 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if correlation_id in self.subscriptions:
                 del self.subscriptions[correlation_id]
 
-        # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        # Unsubscribe if connected - use reference counting
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_last = self._decrement_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_last:
             try:
                 # Unregister scrip with Motilal WebSocket
                 success = self.ws_client.unregister_scrip(
@@ -398,7 +408,7 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                             # Create topic for ZeroMQ
                             mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[mode]
-                            topic = f"{exchange}_{symbol}_{mode_str}"
+                            topic = self._generate_topic(exchange, symbol, mode_str)
 
                             # Publish to ZeroMQ
                             self.publish_market_data(topic, market_data)

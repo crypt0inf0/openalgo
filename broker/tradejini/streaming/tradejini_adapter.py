@@ -204,8 +204,12 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 'is_fallback': is_fallback
             }
 
-        # Subscribe if connected
-        if self.connected and self.ws_client:
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 # Create token string with exchange segment
                 token_str = f"{token}_{brexchange}"
@@ -224,6 +228,7 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.ws_client.subscribeL2([token_str])
 
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
 
@@ -264,8 +269,12 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if correlation_id in self.subscriptions:
                 del self.subscriptions[correlation_id]
 
-        # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        # Unsubscribe if connected - use reference counting
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_last = self._decrement_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_last:
             try:
                 # Tradejini unsubscribes from all tokens for a given type
                 if mode in [1, 2]:
@@ -417,8 +426,8 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.logger.warning(f"Unknown subscription mode: {subscription_mode}")
                     continue
 
-                # Topic format: EXCHANGE_SYMBOL_MODE (like Angel adapter)
-                topic = f"{exchange}_{symbol}_{mode_str}"
+                # Topic format: BROKER_EXCHANGE_SYMBOL_MODE (using base adapter helper)
+                topic = self._generate_topic(exchange, symbol, mode_str)
 
                 # Normalize the data based on subscription mode
                 market_data = self._normalize_market_data(message, actual_mode)

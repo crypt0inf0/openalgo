@@ -177,9 +177,13 @@ class IndmoneyWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 'depth_level': depth_level
             }
 
-        # Subscribe if connected
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{brexchange}|{instrument_token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
         self.logger.info(f"Checking connection status: connected={self.connected}, ws_client={self.ws_client is not None}")
-        if self.connected and self.ws_client:
+        if self.connected and self.ws_client and is_first:
             try:
                 self.logger.info(f"ATTEMPTING SUBSCRIPTION: {symbol}.{exchange}, instrument_token={instrument_token}, mode={indmoney_mode}")
                 self.ws_client.subscribe(
@@ -188,6 +192,7 @@ class IndmoneyWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 )
                 self.logger.info(f"SUBSCRIPTION SENT: {symbol}.{exchange} in {indmoney_mode} mode")
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"SUBSCRIPTION ERROR for {symbol}.{exchange}: {e}", exc_info=True)
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
         else:
@@ -247,8 +252,12 @@ class IndmoneyWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if cache_key in self.last_values:
                 del self.last_values[cache_key]
 
-        # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        # Unsubscribe if connected - use reference counting
+        scrip = f"{brexchange}|{instrument_token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_last = self._decrement_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_last:
             try:
                 self.ws_client.unsubscribe(
                     instruments=[instrument_token],
@@ -386,7 +395,7 @@ class IndmoneyWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             # Map INDmoney mode to OpenAlgo mode string
             mode_str = 'LTP' if mode == 'ltp' else 'QUOTE'
-            topic = f"{exchange}_{symbol}_{mode_str}"
+            topic = self._generate_topic(exchange, symbol, mode_str)
 
             # Normalize the data with caching for value retention
             cache_key = f"{symbol}_{exchange}"

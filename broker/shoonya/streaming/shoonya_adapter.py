@@ -747,7 +747,7 @@ class ShoonyaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         
         # Create topic and publish
         mode_str = {Config.MODE_LTP: 'LTP', Config.MODE_QUOTE: 'QUOTE', Config.MODE_DEPTH: 'DEPTH'}[mode]
-        topic = f"{exchange}_{symbol}_{mode_str}"
+        topic = self._generate_topic(exchange, symbol, mode_str)
         
         self.logger.debug(f"[{mode_str}] Publishing data for {symbol}")
         self.publish_market_data(topic, normalized_data)

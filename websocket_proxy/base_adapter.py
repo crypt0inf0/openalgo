@@ -95,11 +95,87 @@ class BaseBrokerWebSocketAdapter(ABC):
             self.subscriptions = {}
             self.connected = False
             
+            # Reference counting for WebSocket subscriptions
+            # Prevents duplicate subscriptions when multiple clients request same symbol
+            self._ws_subscription_refs = {}  # {scrip: {'touchline': 0, 'depth': 0}}
+            self._ref_lock = threading.Lock()
+            
             self.logger.info(f"BaseBrokerWebSocketAdapter initialized on port {self.zmq_port}")
             
         except Exception as e:
             self.logger.error(f"Error in BaseBrokerWebSocketAdapter init: {e}")
             raise
+    
+    def _increment_ref(self, scrip: str, sub_type: str = 'touchline') -> bool:
+        """
+        Increment reference count for a subscription.
+        
+        Args:
+            scrip: Subscription key (e.g., 'NSE|1594' or 'RELIANCE_NSE')
+            sub_type: Type of subscription - 'touchline' or 'depth'
+            
+        Returns:
+            bool: True if this is the first subscription (should send to broker)
+        """
+        with self._ref_lock:
+            if scrip not in self._ws_subscription_refs:
+                self._ws_subscription_refs[scrip] = {'touchline': 0, 'depth': 0}
+            
+            is_first = self._ws_subscription_refs[scrip][sub_type] == 0
+            self._ws_subscription_refs[scrip][sub_type] += 1
+            
+            if is_first:
+                self.logger.info(f"First {sub_type} subscription for {scrip}")
+            else:
+                self.logger.debug(f"Additional {sub_type} subscription for {scrip} (count: {self._ws_subscription_refs[scrip][sub_type]})")
+            
+            return is_first
+    
+    def _decrement_ref(self, scrip: str, sub_type: str = 'touchline') -> bool:
+        """
+        Decrement reference count for a subscription.
+        
+        Args:
+            scrip: Subscription key
+            sub_type: Type of subscription - 'touchline' or 'depth'
+            
+        Returns:
+            bool: True if this was the last subscription (should unsubscribe from broker)
+        """
+        with self._ref_lock:
+            if scrip not in self._ws_subscription_refs:
+                self.logger.warning(f"Attempted to decrement ref for unknown scrip: {scrip}")
+                return False
+            
+            if self._ws_subscription_refs[scrip][sub_type] > 0:
+                self._ws_subscription_refs[scrip][sub_type] -= 1
+            
+            is_last = self._ws_subscription_refs[scrip][sub_type] == 0
+            
+            if is_last:
+                self.logger.info(f"Last {sub_type} subscription for {scrip}")
+                
+                # Clean up entry if no subscriptions remain
+                if all(v == 0 for v in self._ws_subscription_refs[scrip].values()):
+                    del self._ws_subscription_refs[scrip]
+            
+            return is_last
+    
+    def _get_ref_count(self, scrip: str, sub_type: str = 'touchline') -> int:
+        """Get current reference count for a subscription."""
+        with self._ref_lock:
+            if scrip not in self._ws_subscription_refs:
+                return 0
+            return self._ws_subscription_refs[scrip].get(sub_type, 0)
+    
+    def _clear_all_refs(self) -> int:
+        """Clear all subscription references. Returns count of cleared entries."""
+        with self._ref_lock:
+            count = len(self._ws_subscription_refs)
+            self._ws_subscription_refs.clear()
+            if count > 0:
+                self.logger.info(f"Cleared all subscription references ({count} entries)")
+            return count
     
     def _initialize_shared_context(self):
         """
@@ -261,6 +337,24 @@ class BaseBrokerWebSocketAdapter(ABC):
             ])
         except Exception as e:
             self.logger.exception(f"Error publishing market data: {e}")
+    
+    def _generate_topic(self, exchange: str, symbol: str, mode_str: str) -> str:
+        """
+        Generate standardized topic for ZMQ publishing.
+        
+        All adapters should use this method to ensure consistent topic format
+        that matches what the server expects: BROKER_EXCHANGE_SYMBOL_MODE
+        
+        Args:
+            exchange: Exchange code (e.g., 'NSE', 'BSE', 'NFO')
+            symbol: Trading symbol (e.g., 'RELIANCE', 'NIFTY')
+            mode_str: Mode string (e.g., 'LTP', 'QUOTE', 'DEPTH')
+            
+        Returns:
+            str: Topic in format BROKER_EXCHANGE_SYMBOL_MODE
+        """
+        broker = getattr(self, 'broker_name', 'unknown')
+        return f"{broker}_{exchange}_{symbol}_{mode_str}"
     
     def _create_success_response(self, message, **kwargs):
         """

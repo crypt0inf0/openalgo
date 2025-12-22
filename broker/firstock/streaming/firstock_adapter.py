@@ -586,7 +586,7 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 
                 # Firstock provides all data in one feed, so we publish based on requested mode
                 mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[mode]
-                topic = f"{exchange}_{symbol}_{mode_str}"
+                topic = self._generate_topic(exchange, symbol, mode_str)
                 
                 # Normalize the data based on the requested mode using processed snapshot
                 market_data = self._normalize_market_data(processed_data, mode)

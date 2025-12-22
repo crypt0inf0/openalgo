@@ -190,11 +190,16 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.token_map[str(token)] = (symbol, exchange, mode)
             self.logger.info(f"Subscribed: token={token}, symbol={symbol}, exchange={exchange}, preference={preference}")
 
-        # Subscribe if connected
-        if self.connected and self.ws_client:
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 self.ws_client.subscribe([preference])
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
 
@@ -248,8 +253,12 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if str(token) in self.token_map:
                 del self.token_map[str(token)]
 
-        # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        # Unsubscribe if connected - use reference counting
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_last = self._decrement_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_last:
             try:
                 self.ws_client.unsubscribe([preference])
             except Exception as e:
@@ -356,7 +365,7 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
             mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(subscription_mode, 'QUOTE')
 
             # Create topic for ZeroMQ
-            topic = f"{exchange}_{symbol}_{mode_str}"
+            topic = self._generate_topic(exchange, symbol, mode_str)
 
             # Normalize the data
             market_data = self._normalize_market_data(message, subscription_mode)

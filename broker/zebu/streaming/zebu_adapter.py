@@ -779,7 +779,7 @@ class ZebuWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # Create topic and publish
         mode_str = {Config.MODE_LTP: 'LTP', Config.MODE_QUOTE: 'QUOTE', Config.MODE_DEPTH: 'DEPTH'}[mode]
-        topic = f"{exchange}_{symbol}_{mode_str}"
+        topic = self._generate_topic(exchange, symbol, mode_str)
 
         # Get client count for this subscription
         client_count = subscription.get('client_count', 1)

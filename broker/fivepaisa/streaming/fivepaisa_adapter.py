@@ -203,13 +203,18 @@ class FivepaisaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 'scrip_data': scrip_data
             }
 
-        # Subscribe if connected
-        if self.connected and self.ws_client:
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 self.logger.info(f"Subscribing to {symbol} ({exchange}/{brexchange}) - Token: {token}, Method: {method}, Exch: {exch_code}, Type: {exch_type}")
                 self.ws_client.subscribe(method, scrip_data)
                 self.logger.info(f"Successfully sent subscription request for {symbol}.{exchange}")
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
 
@@ -265,8 +270,12 @@ class FivepaisaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if correlation_id in self.subscriptions:
                 del self.subscriptions[correlation_id]
 
-        # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        # Unsubscribe if connected - use reference counting
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_last = self._decrement_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_last:
             try:
                 self.ws_client.unsubscribe(method, scrip_data)
             except Exception as e:
@@ -339,7 +348,7 @@ class FivepaisaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 mode = subscription['mode']
 
                 mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[mode]
-                topic = f"{exchange}_{symbol}_{mode_str}"
+                topic = self._generate_topic(exchange, symbol, mode_str)
 
                 # Apply snapshot logic - merge current message with last known values
                 token_key = f"{token}_{mode}"

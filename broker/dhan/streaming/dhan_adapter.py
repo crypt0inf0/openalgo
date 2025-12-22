@@ -541,7 +541,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 }
                 
                 mode_str = mode_map.get(data_type, 'UNKNOWN')
-                topic = f"{exchange}_{symbol}_{mode_str}"
+                topic = self._generate_topic(exchange, symbol, mode_str)
                 
                 self.publish_market_data(topic, market_data)
                 
@@ -628,7 +628,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 }
                 
                 # Publish with standard DEPTH topic (mode 3)
-                topic = f"{exchange}_{symbol}_DEPTH"
+                topic = self._generate_topic(exchange, symbol, 'DEPTH')
                 self.publish_market_data(topic, market_data)
                 
                 # Clear accumulator

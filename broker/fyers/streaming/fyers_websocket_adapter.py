@@ -813,8 +813,8 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 subscription_mode = data.get('subscription_mode', 1)
                 mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(subscription_mode, 'QUOTE')
                 
-                # Format: EXCHANGE_SYMBOL_MODE (following Angel adapter pattern)
-                topic = f"{exchange}_{symbol}_{mode_str}"
+                # Format: BROKER_EXCHANGE_SYMBOL_MODE (following base adapter pattern)
+                topic = self._generate_topic(exchange, symbol, mode_str)
                 
                 # Use the base adapter's publish_market_data method like Angel does
                 self.publish_market_data(topic, data)

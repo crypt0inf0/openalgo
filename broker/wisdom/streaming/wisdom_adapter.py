@@ -358,11 +358,16 @@ class WisdomWebSocketAdapter(BaseBrokerWebSocketAdapter):
             token_info = f"type={type(token)}, len={len(str(token))}, value={str(token)[:4]}...{str(token)[-4:]}" if token else "None"
             self.logger.debug(f"Stored subscription [{correlation_id}]: symbol={symbol}, exchange={exchange}, brexchange={brexchange}, token_info={token_info}, mode={mode}")
         
-        # Subscribe if connected
-        if self.connected and self.ws_client:
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{exchange_type}|{token_str}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 self.ws_client.subscribe(correlation_id, mode, instruments)
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
         
@@ -442,15 +447,20 @@ class WisdomWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 del self.subscriptions[correlation_id]
                 self.logger.debug(f"Removed {symbol}.{exchange} from subscription registry")
         
-        # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        # Unsubscribe if connected - use reference counting
+        exchange_type = WisdomExchangeMapper.get_exchange_type(brexchange)
+        scrip = f"{exchange_type}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_last = self._decrement_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_last:
             try:
-                self.logger.debug(f"Sending unsubscribe request for {symbol}.{exchange} to XTS server")
+                self.logger.info(f"Sending unsubscribe request for {symbol}.{exchange} to XTS server")
                 self.ws_client.unsubscribe(correlation_id, mode, instruments)
                 self.logger.info(f"Successfully sent unsubscribe request for {symbol}.{exchange}")
                 
                 # Always disconnect and perform cleanup after unsubscription
-                self.logger.debug(f"Initiating disconnect and cleanup after unsubscription")
+                self.logger.info(f"Initiating disconnect and cleanup after unsubscription")
                 self.disconnect()
                 
                 return self._create_success_response(
@@ -641,8 +651,8 @@ class WisdomWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 # We'll publish the data anyway since we received it
             
             # Create topic for ZeroMQ
-            # Use standard topic format without broker prefix for WebSocket proxy routing
-            topic = f"{exchange}_{symbol}_{mode_str}"
+            # Use standard topic format with broker prefix for WebSocket proxy routing
+            topic = self._generate_topic(exchange, symbol, mode_str)
             
             # Normalize the data
             market_data = self._normalize_market_data(data, mode)

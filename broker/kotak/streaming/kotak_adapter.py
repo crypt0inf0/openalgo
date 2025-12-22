@@ -278,7 +278,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     for mode in active_modes:
                         mode_map = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}
                         mode_str = mode_map.get(mode, 'LTP')
-                        topic = f"{exchange}_{symbol}_{mode_str}"
+                        topic = self._generate_topic(exchange, symbol, mode_str)
                         if mode == 1 and has_ltp_data:
                             publish_data = {
                                 'ltp': float(ltp),

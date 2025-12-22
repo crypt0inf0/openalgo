@@ -898,7 +898,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
             
             # Publish to all applicable topics
             for mode_name, mode_num in topics_to_publish:
-                topic = f"{exchange}_{symbol}_{mode_name}"
+                topic = self._generate_topic(exchange, symbol, mode_name)
                 self.logger.debug(f"Publishing {msg_type} to {topic}")
             
             # Add timestamp if not present
@@ -907,7 +907,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
             
             # Publish to all applicable topics
             for mode_name, mode_num in topics_to_publish:
-                topic = f"{exchange}_{symbol}_{mode_name}"
+                topic = self._generate_topic(exchange, symbol, mode_name)
                 
                 # Prepare data based on mode
                 if mode_num == 1:  # LTP mode

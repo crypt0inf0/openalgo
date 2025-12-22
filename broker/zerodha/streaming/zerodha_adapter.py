@@ -91,11 +91,26 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if not self.access_token:
                 return {'status': 'error', 'message': 'Invalid access token'}
             
-            # Initialize WebSocket client
+            # Define token refresh callback for handling token expiry
+            def get_fresh_token() -> Optional[str]:
+                """Callback to get fresh access token from database"""
+                try:
+                    fresh_auth_token = get_auth_token(self.user_id)
+                    if fresh_auth_token:
+                        if ':' in fresh_auth_token:
+                            parts = fresh_auth_token.split(':')
+                            return parts[1] if len(parts) >= 2 else fresh_auth_token
+                        return fresh_auth_token
+                except Exception as e:
+                    self.logger.error(f"Error refreshing token: {e}")
+                return None
+            
+            # Initialize WebSocket client with token refresh callback
             self.ws_client = ZerodhaWebSocket(
                 api_key=self.api_key,
                 access_token=self.access_token,
-                on_ticks=self._handle_ticks
+                on_ticks=self._handle_ticks,
+                token_refresh_callback=get_fresh_token  # Enables automatic token refresh on reconnect
             )
             
             # Set up WebSocket callbacks
@@ -286,20 +301,26 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Track subscription with mapped exchange for consistency
             subscription_exchange = 'NSE' if exchange == 'NSE_INDEX' else exchange
             
-            # Add to queue for batch processing
-            with self.lock:
-                self.subscription_queue.append({
-                    'token': token,
-                    'mode': zerodha_mode,
-                    'symbol': symbol,
-                    'exchange': exchange,
-                    'subscription_exchange': subscription_exchange,
-                    'mode_int': mode
-                })
-                
-                # If this is the first subscription in queue, start the batch timer
-                if len(self.subscription_queue) == 1:
-                    self._start_batch_timer()
+            # Reference counting to prevent duplicate WebSocket subscriptions
+            scrip = f"{exchange}|{token}"
+            sub_type = 'depth' if mode == 3 else 'touchline'
+            is_first = self._increment_ref(scrip, sub_type)
+            
+            # Add to queue for batch processing only if first subscription
+            if is_first:
+                with self.lock:
+                    self.subscription_queue.append({
+                        'token': token,
+                        'mode': zerodha_mode,
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'subscription_exchange': subscription_exchange,
+                        'mode_int': mode
+                    })
+                    
+                    # If this is the first subscription in queue, start the batch timer
+                    if len(self.subscription_queue) == 1:
+                        self._start_batch_timer()
             
             # Immediately track subscription (even before actual WebSocket subscription)
             with self.lock:
@@ -372,10 +393,9 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def _generate_topic(self, symbol: str, subscription_exchange: str, mode_str: str) -> str:
         """
         Generate topic for market data publishing.
-        Uses original exchange format for maximum client compatibility.
+        Uses broker prefix for proper ZMQ routing.
         """
-        # ✅ FIXED: Keep original exchange format for client compatibility
-        return f"{subscription_exchange}_{symbol}_{mode_str}"
+        return f"{self.broker_name}_{subscription_exchange}_{symbol}_{mode_str}"
 
     def _map_data_exchange(self, subscription_exchange: str) -> str:
         """

@@ -624,7 +624,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             mode = subscription['mode']
             
             mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[mode]
-            topic = f"{orig_exchange}_{symbol}_{mode_str}"
+            topic = self._generate_topic(orig_exchange, symbol, mode_str)
             
             # Use cache BEFORE normalization (like Shoonya does)
             # This preserves raw field names for cache logic
@@ -662,7 +662,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     if sub['token'] == token and sub['mode'] in [1, 2]:  # LTP or Quote mode
                         mode = sub['mode']
                         mode_str = {1: 'LTP', 2: 'QUOTE'}[mode]
-                        topic = f"{exchange}_{symbol}_{mode_str}"
+                        topic = self._generate_topic(exchange, symbol, mode_str)
                         
                         # Create mode-specific data
                         if mode == 1:  # LTP mode - only send LTP
@@ -753,7 +753,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             symbol = subscription['symbol']
             orig_exchange = subscription['exchange']
             
-            topic = f"{orig_exchange}_{symbol}_DEPTH"
+            topic = self._generate_topic(orig_exchange, symbol, 'DEPTH')
             
             # Use cache BEFORE normalization (like Shoonya)
             cached_data = self.market_cache.update(token, message)

@@ -185,7 +185,7 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 exchange = subscription['exchange']
                 mode = subscription['mode']
                 mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[mode]
-                topic = f"{exchange}_{symbol}_{mode_str}"
+                topic = self._generate_topic(exchange, symbol, mode_str)
 
                 # Deep copy the normalized data to avoid mutation
                 market_data = copy.deepcopy(market_data_base)

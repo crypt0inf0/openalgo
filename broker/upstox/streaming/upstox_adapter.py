@@ -123,8 +123,12 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.subscriptions[correlation_id] = subscription_info
             self.logger.info(f"Stored subscription: {correlation_id} -> {subscription_info}")
         
-        # Subscribe if connected (Angel pattern)
-        if self.connected and self.ws_client:
+        # Subscribe if connected (Angel pattern) - use reference counting
+        scrip = subscription_info['instrument_key']
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 future = asyncio.run_coroutine_threadsafe(
                     self.ws_client.subscribe([instrument_key], self._get_upstox_mode(mode, depth_level)),
@@ -137,6 +141,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     return self._create_success_response(f"Subscribed to {symbol} on {exchange}")
                 else:
                     # Clean up on failure
+                    self._decrement_ref(scrip, sub_type)
                     with self.lock:
                         self.subscriptions.pop(correlation_id, None)
                     return self._create_error_response("SUBSCRIBE_FAILED", f"Failed to subscribe to {symbol} on {exchange}")
@@ -144,6 +149,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
             except Exception as e:
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 # Clean up on error
+                self._decrement_ref(scrip, sub_type)
                 with self.lock:
                     self.subscriptions.pop(correlation_id, None)
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
@@ -298,10 +304,10 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         return None
 
     def _create_topic(self, exchange: str, symbol: str, mode: int) -> str:
-        """Create ZMQ topic for publishing"""
+        """Create ZMQ topic for publishing with broker prefix"""
         mode_map = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}
         mode_str = mode_map.get(mode, 'QUOTE')
-        return f"{exchange}_{symbol}_{mode_str}"
+        return f"{self.broker_name}_{exchange}_{symbol}_{mode_str}"
 
     # WebSocket event handlers
     async def _on_open(self):

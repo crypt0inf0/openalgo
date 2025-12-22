@@ -34,10 +34,10 @@ class ZerodhaWebSocket:
     MODE_FULL = "full"
     
     # Connection settings based on official Zerodha WebSocket API documentation
-    PING_INTERVAL = None  # Disable automatic pings - Zerodha sends heartbeats
+    PING_INTERVAL = 30  # Send ping every 30 seconds to keep connection alive
     KEEPALIVE_INTERVAL = 30  # Check connection every 30 seconds 
-    PING_TIMEOUT = 10
-    CONNECT_TIMEOUT = 10  # Shorter connection timeout
+    PING_TIMEOUT = 10   # Wait 10 seconds for pong response
+    CONNECT_TIMEOUT = 15  # Slightly increased connection timeout for stability
     MAX_MESSAGE_SIZE = 10 * 1024 * 1024  # 10MB for handling large data
     
     # Subscription batching (Zerodha supports up to 3000 instruments per connection)
@@ -49,11 +49,19 @@ class ZerodhaWebSocket:
     RECONNECT_MAX_DELAY = 60  # Maximum delay between reconnection attempts
     RECONNECT_MAX_TRIES = 50  # Maximum number of reconnection attempts
     
-    def __init__(self, api_key: str, access_token: str, on_ticks: Callable[[List[Dict]], None] = None):
-        """Initialize the Zerodha WebSocket client"""
+    def __init__(self, api_key: str, access_token: str, on_ticks: Callable[[List[Dict]], None] = None, token_refresh_callback: Callable[[], Optional[str]] = None):
+        """Initialize the Zerodha WebSocket client
+        
+        Args:
+            api_key: Zerodha API key
+            access_token: Initial access token
+            on_ticks: Callback for tick data
+            token_refresh_callback: Optional callback to get fresh access token (for token refresh)
+        """
         self.api_key = api_key
         self.access_token = access_token
         self.on_ticks = on_ticks
+        self.token_refresh_callback = token_refresh_callback  # Callback to refresh expired tokens
         self.websocket = None
         self.connected = False
         self.running = False
@@ -92,8 +100,8 @@ class ZerodhaWebSocket:
         self.on_disconnect = None
         self.on_error = None
         
-        # WebSocket URL
-        self.ws_url = f"wss://ws.kite.trade?api_key={self.api_key}&access_token={self.access_token}"
+        # WebSocket URL (will be regenerated before each connection to handle token refresh)
+        self._base_ws_url = "wss://ws.kite.trade"
         
         # Statistics
         self.message_count = 0
@@ -486,9 +494,22 @@ class ZerodhaWebSocket:
             # Create new connection following Zerodha API specifications
             # URL format: wss://ws.kite.trade?api_key=xxx&access_token=xxx
             
+            # CRITICAL: Refresh access token before reconnecting (handles token expiry)
+            if self.token_refresh_callback:
+                try:
+                    fresh_token = self.token_refresh_callback()
+                    if fresh_token and fresh_token != self.access_token:
+                        self.access_token = fresh_token
+                        self.logger.info("🔄 Access token refreshed for reconnection")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Token refresh callback failed: {e}")
+            
+            # Generate fresh WebSocket URL with current token
+            ws_url = f"{self._base_ws_url}?api_key={self.api_key}&access_token={self.access_token}"
+            
             self.websocket = await asyncio.wait_for(
                 websockets.client.connect(
-                    self.ws_url,
+                    ws_url,  # Use freshly generated URL with current token
                     ping_interval=self.PING_INTERVAL,  # None - let Zerodha handle heartbeats
                     ping_timeout=self.PING_TIMEOUT,
                     close_timeout=5,
@@ -930,7 +951,19 @@ class ZerodhaWebSocket:
         for mode, tokens in mode_groups.items():
             for i in range(0, len(tokens), self.MAX_TOKENS_PER_SUBSCRIBE):
                 batch = tokens[i:i + self.MAX_TOKENS_PER_SUBSCRIBE]
-                await self._subscribe_batch(batch, mode)
+                
+                # Retry logic for robust reconnection
+                max_retries = 3
+                for attempt in range(max_retries):
+                    success = await self._subscribe_batch(batch, mode)
+                    if success:
+                        break
+                    
+                    self.logger.warning(f"⚠️ Re-subscription batch failed (attempt {attempt+1}/{max_retries}). Retrying...")
+                    await asyncio.sleep(2 * (attempt + 1))
+                else:
+                    self.logger.error(f"❌ Failed to re-subscribe batch of {len(batch)} tokens after {max_retries} attempts")
+
                 await asyncio.sleep(self.SUBSCRIPTION_DELAY)
     
     async def _health_check_loop(self):

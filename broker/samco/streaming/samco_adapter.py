@@ -218,11 +218,16 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 'is_fallback': is_fallback
             }
 
-        # Subscribe if connected
-        if self.connected and self.ws_client:
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 self.ws_client.subscribe(correlation_id, mode, token_list)
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
 
@@ -289,8 +294,12 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if correlation_id in self.subscriptions:
                 del self.subscriptions[correlation_id]
 
-        # Unsubscribe if connected
-        if self.connected and self.ws_client:
+        # Unsubscribe if connected - use reference counting
+        scrip = f"{brexchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_last = self._decrement_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_last:
             try:
                 self.ws_client.unsubscribe(correlation_id, mode, token_list)
             except Exception as e:
@@ -428,7 +437,7 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                 # Use subscription mode for topic
                 mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(mode, 'QUOTE')
-                topic = f"{exchange}_{symbol}_{mode_str}"
+                topic = self._generate_topic(exchange, symbol, mode_str)
 
                 # Normalize the data based on subscription mode
                 market_data = self._normalize_market_data(message, mode)

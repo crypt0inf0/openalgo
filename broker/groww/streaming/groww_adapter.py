@@ -312,8 +312,12 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 'depth_level': depth_level
             }
         
-        # Subscribe if connected
-        if self.connected and self.ws_client:
+        # Subscribe if connected - use reference counting to avoid duplicates
+        scrip = f"{groww_exchange}|{token}"
+        sub_type = 'depth' if mode == 3 else 'touchline'
+        is_first = self._increment_ref(scrip, sub_type)
+        
+        if self.connected and self.ws_client and is_first:
             try:
                 if mode in [1, 2]:  # LTP or Quote mode
                     if mode == 2:
@@ -357,6 +361,7 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.logger.info(f"F&O subscription key created: {sub_key}")
                 
             except Exception as e:
+                self._decrement_ref(scrip, sub_type)  # Rollback on error
                 self.logger.error(f"Error subscribing to {symbol}.{exchange}: {e}")
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
         
@@ -393,11 +398,14 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Remove from subscriptions
             del self.subscriptions[correlation_id]
         
-        # Unsubscribe if we have a subscription key
+        # Unsubscribe if we have a subscription key - use reference counting
         if correlation_id in self.subscription_keys:
             sub_key = self.subscription_keys[correlation_id]
+            scrip = f"{groww_exchange}|{token}"
+            sub_type = 'depth' if mode == 3 else 'touchline'
+            is_last = self._decrement_ref(scrip, sub_type)
             
-            if self.connected and self.ws_client:
+            if self.connected and self.ws_client and is_last:
                 try:
                     self.ws_client.unsubscribe(sub_key)
                     self.logger.info(f"Unsubscribed from {symbol}.{exchange}")
@@ -555,10 +563,10 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
             elif subscription_mode == 2:  # Quote mode
                 actual_mode = 2
 
-            # Important: Create topic in the same format as Angel using ACTUAL mode
-            # Format: EXCHANGE_SYMBOL_MODE (without broker name, like Angel does)
+            # Important: Create topic with broker prefix using ACTUAL mode
+            # Format: BROKER_EXCHANGE_SYMBOL_MODE (using base adapter helper)
             mode_str = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}[actual_mode]
-            topic = f"{exchange}_{symbol}_{mode_str}"
+            topic = self._generate_topic(exchange, symbol, mode_str)
 
             # Normalize the data using actual mode
             market_data = self._normalize_market_data(data, actual_mode)
