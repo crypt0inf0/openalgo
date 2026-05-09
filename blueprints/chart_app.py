@@ -13,7 +13,9 @@ Build and deploy:
 
 from pathlib import Path
 
-from flask import Blueprint, send_file, send_from_directory
+from flask import Blueprint, jsonify, send_file, send_from_directory, session
+
+from database.auth_db import get_api_key_for_tradingview
 
 chart_bp = Blueprint("chart", __name__)
 
@@ -53,6 +55,18 @@ def chart_assets(filename):
     response = send_from_directory(CHART_DIST / "assets", filename)
     response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return response
+
+
+@chart_bp.route("/chart/config")
+def chart_config():
+    """Return the logged-in user's API key so the chart SPA skips the key dialog."""
+    username = session.get("user")
+    if not username:
+        return jsonify({"error": "Not authenticated"}), 401
+    api_key = get_api_key_for_tradingview(username)
+    if not api_key:
+        return jsonify({"error": "No API key configured"}), 404
+    return jsonify({"api_key": api_key})
 
 
 @chart_bp.route("/chart/<path:subpath>")
