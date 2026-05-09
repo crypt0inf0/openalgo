@@ -68,6 +68,7 @@ from blueprints.react_app import (  # Import React frontend blueprint
     react_bp,
     serve_react_app,
 )
+from blueprints.chart_app import chart_bp, is_chart_available  # Import Chart blueprint
 from blueprints.sandbox import sandbox_bp  # Import the sandbox blueprint
 from blueprints.search import search_bp
 from blueprints.security import security_bp  # Import the security blueprint
@@ -218,6 +219,13 @@ def create_app():
         logger.debug("React frontend enabled (frontend/dist found)")
     else:
         logger.warning("React frontend not available - run 'npm run build' in frontend/")
+
+    if is_chart_available():
+        app.register_blueprint(chart_bp)
+        logger.debug("Chart app enabled (chart/dist found)")
+    else:
+        logger.warning("Chart app not available - build openalgo-chart and copy dist/ to chart/dist/")
+        app.register_blueprint(chart_bp)  # register anyway so /chart shows a helpful error page
 
     app.register_blueprint(api_v1_bp)
 
