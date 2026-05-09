@@ -1,4 +1,4 @@
-import { BarChart3, BookOpen, CandlestickChart, LogOut, Menu, Moon, Sun, Zap } from 'lucide-react'
+import { BarChart3, BookOpen, LogOut, Menu, Moon, Sun, Zap } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { showToast } from '@/utils/toast'
@@ -108,32 +108,36 @@ export function Navbar() {
                 <div className="px-3 py-2 text-xs font-medium text-muted-foreground uppercase tracking-wider">
                   Navigation
                 </div>
-                {mobileSheetItems.map((item) => (
-                  <Link
-                    key={item.href}
-                    to={item.href}
-                    onClick={() => setMobileOpen(false)}
-                    className={cn(
-                      'flex items-center gap-3 rounded-lg px-3 py-3 text-sm transition-colors min-h-[44px] touch-manipulation',
-                      isActive(item.href)
-                        ? 'bg-primary text-primary-foreground'
-                        : 'hover:bg-muted active:bg-muted'
-                    )}
-                  >
-                    <item.icon className="h-4 w-4" />
-                    {item.label}
-                  </Link>
-                ))}
-                <a
-                  href="/chart"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-3 rounded-lg px-3 py-3 text-sm transition-colors min-h-[44px] touch-manipulation hover:bg-muted active:bg-muted"
-                  onClick={() => setMobileOpen(false)}
-                >
-                  <CandlestickChart className="h-4 w-4" />
-                  Chart
-                </a>
+                {mobileSheetItems.map((item) =>
+                  item.external ? (
+                    <a
+                      key={item.href}
+                      href={item.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={() => setMobileOpen(false)}
+                      className="flex items-center gap-3 rounded-lg px-3 py-3 text-sm transition-colors min-h-[44px] touch-manipulation hover:bg-muted active:bg-muted"
+                    >
+                      <item.icon className="h-4 w-4" />
+                      {item.label}
+                    </a>
+                  ) : (
+                    <Link
+                      key={item.href}
+                      to={item.href}
+                      onClick={() => setMobileOpen(false)}
+                      className={cn(
+                        'flex items-center gap-3 rounded-lg px-3 py-3 text-sm transition-colors min-h-[44px] touch-manipulation',
+                        isActive(item.href)
+                          ? 'bg-primary text-primary-foreground'
+                          : 'hover:bg-muted active:bg-muted'
+                      )}
+                    >
+                      <item.icon className="h-4 w-4" />
+                      {item.label}
+                    </Link>
+                  )
+                )}
               </nav>
 
               {/* Profile menu items for mobile access */}
@@ -180,28 +184,32 @@ export function Navbar() {
 
         {/* Desktop Navigation */}
         <nav className="hidden md:flex items-center gap-1">
-          {navItems.map((item) => (
-            <Link
-              key={item.href}
-              to={item.href}
-              className={cn(
-                'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-                isActive(item.href)
-                  ? 'bg-primary text-primary-foreground'
-                  : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-              )}
-            >
-              {item.label}
-            </Link>
-          ))}
-          <a
-            href="/chart"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            Chart
-          </a>
+          {navItems.map((item) =>
+            item.external ? (
+              <a
+                key={item.href}
+                href={item.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                {item.label}
+              </a>
+            ) : (
+              <Link
+                key={item.href}
+                to={item.href}
+                className={cn(
+                  'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+                  isActive(item.href)
+                    ? 'bg-primary text-primary-foreground'
+                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                )}
+              >
+                {item.label}
+              </Link>
+            )
+          )}
         </nav>
 
         {/* Right Side */}
@@ -284,17 +292,19 @@ export function Navbar() {
                   {item.label}
                 </DropdownMenuItem>
               ))}
-              <DropdownMenuItem asChild>
-                <a
-                  href="/chart"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-2"
-                >
-                  <CandlestickChart className="h-4 w-4" />
-                  Chart
-                </a>
-              </DropdownMenuItem>
+              {navItems.filter((item) => item.external).map((item) => (
+                <DropdownMenuItem key={item.href} asChild>
+                  <a
+                    href={item.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2"
+                  >
+                    <item.icon className="h-4 w-4" />
+                    {item.label}
+                  </a>
+                </DropdownMenuItem>
+              ))}
               <DropdownMenuItem asChild>
                 <a
                   href="https://docs.openalgo.in"
