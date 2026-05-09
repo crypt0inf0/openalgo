@@ -1,4 +1,4 @@
-import { BarChart3, BookOpen, LogOut, Menu, Moon, Sun, Zap } from 'lucide-react'
+import { BarChart3, BookOpen, CandlestickChart, LogOut, Menu, Moon, Sun, Zap } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { showToast } from '@/utils/toast'
@@ -124,6 +124,16 @@ export function Navbar() {
                     {item.label}
                   </Link>
                 ))}
+                <a
+                  href="/chart"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-3 rounded-lg px-3 py-3 text-sm transition-colors min-h-[44px] touch-manipulation hover:bg-muted active:bg-muted"
+                  onClick={() => setMobileOpen(false)}
+                >
+                  <CandlestickChart className="h-4 w-4" />
+                  Chart
+                </a>
               </nav>
 
               {/* Profile menu items for mobile access */}
@@ -184,6 +194,14 @@ export function Navbar() {
               {item.label}
             </Link>
           ))}
+          <a
+            href="/chart"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            Chart
+          </a>
         </nav>
 
         {/* Right Side */}
@@ -266,6 +284,17 @@ export function Navbar() {
                   {item.label}
                 </DropdownMenuItem>
               ))}
+              <DropdownMenuItem asChild>
+                <a
+                  href="/chart"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-2"
+                >
+                  <CandlestickChart className="h-4 w-4" />
+                  Chart
+                </a>
+              </DropdownMenuItem>
               <DropdownMenuItem asChild>
                 <a
                   href="https://docs.openalgo.in"
