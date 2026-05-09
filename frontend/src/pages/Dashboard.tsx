@@ -1,4 +1,4 @@
-import { BarChart3, BookOpen, FileText, MessageCircle, Search, Zap } from 'lucide-react'
+import { BarChart3, BookOpen, CandlestickChart, FileText, MessageCircle, Search, Zap } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useOrderEventRefresh } from '@/hooks/useOrderEventRefresh'
@@ -194,6 +194,18 @@ export default function Dashboard() {
   }
 
   const quickAccessCards = [
+    {
+      href: '/chart',
+      label: 'OpenAlgo Chart',
+      description: 'Advanced charting with drawing tools & indicators',
+      icon: CandlestickChart,
+      gradient:
+        'from-emerald-500/10 to-emerald-500/5 hover:from-emerald-500/20 hover:to-emerald-500/10',
+      iconBg: 'bg-emerald-500/20',
+      iconColor: 'text-emerald-500',
+      borderColor: 'border-emerald-500/20 hover:border-emerald-500/40',
+      external: true,
+    },
     {
       href: '/search',
       label: 'OpenAlgo Symbols',
