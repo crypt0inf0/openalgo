@@ -49,9 +49,9 @@ export const navItems: NavItem[] = [
 export const bottomNavItems: NavItem[] = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/orderbook', label: 'Orderbook', icon: ClipboardList },
-  { href: '/tradebook', label: 'Tradebook', icon: FileText },
   { href: '/positions', label: 'Positions', icon: TrendingUp },
   { href: '/strategy', label: 'Strategy', icon: Code2 },
+  { href: '/chart', label: 'Chart', icon: CandlestickChart, external: true },
 ]
 
 // Paths in bottom nav (for filtering mobile sheet items)
